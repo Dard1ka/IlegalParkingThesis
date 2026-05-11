@@ -1,0 +1,80 @@
+# ══════════════════════════════════════════════════════════════
+# Illegal Parking Detection — Docker Compose
+# ──────────────────────────────────────────────────────────────
+# Jalankan dari folder docker/:
+#   docker compose up --build
+#
+# Akses:
+#   - Dashboard : http://localhost:5173
+#   - API       : http://localhost:8000
+#   - API docs  : http://localhost:8000/docs
+# ══════════════════════════════════════════════════════════════
+
+services:
+  # ────────────────────────────────────────────────────────────
+  # Backend — FastAPI + YOLOv8 + TTS
+  # ────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ..                       # root project (punya backend/ + requirements.txt)
+      dockerfile: docker/backend/Dockerfile
+    image: illegal-parking-backend:latest
+    container_name: parking-backend
+    restart: unless-stopped
+
+    ports:
+      - "8000:8000"
+
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SDL_AUDIODRIVER=${SDL_AUDIODRIVER:-dummy}   # "dummy" = silent, "alsa"/"pulse" kalau host Linux
+      - ENABLE_TTS=${ENABLE_TTS:-true}
+      - TZ=${TZ:-Asia/Jakarta}
+
+    volumes:
+      # Model weights — tidak di-copy ke image supaya ringan
+      - ../best.pt:/app/best.pt:ro
+      - ../triangle.pt:/app/triangle.pt:ro
+      # Video input (read-only, untuk testing)
+      - ../input4.mp4:/app/input4.mp4:ro
+      # Upload dir persistent
+      - ../uploads:/app/uploads
+      # TTS temp
+      - ../outputs:/app/outputs
+
+    # GPU support (aktifkan kalau host punya NVIDIA + nvidia-container-toolkit)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+    networks:
+      - parking-net
+
+  # ────────────────────────────────────────────────────────────
+  # Frontend — React (nginx static)
+  # ────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/frontend/Dockerfile
+    image: illegal-parking-frontend:latest
+    container_name: parking-frontend
+    restart: unless-stopped
+
+    ports:
+      - "5173:80"
+
+    depends_on:
+      - backend
+
+    networks:
+      - parking-net
+
+# ══════════════════════════════════════════════════════════════
+networks:
+  parking-net:
+    driver: bridge

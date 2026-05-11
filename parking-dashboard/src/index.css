@@ -1,0 +1,176 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─── Design Tokens ─────────────────────────────── */
+:root {
+  /* Backgrounds — softer, less harsh */
+  --void:        #08090f;
+  --surface:     #0d0f1a;
+  --panel:       #111320;
+  --panel-light: #161929;
+  --card:        #13162280;
+  --edge:        rgba(255,255,255,0.06);
+  --edge-bright: rgba(255,255,255,0.10);
+
+  /* Accent colors — sedikit lebih muted, masih pop */
+  --cyan:        #22d3ee;
+  --cyan-soft:   rgba(34, 211, 238, 0.12);
+  --amber:       #fbbf24;
+  --amber-soft:  rgba(251, 191, 36, 0.12);
+  --red:         #f87171;
+  --red-soft:    rgba(248, 113, 113, 0.12);
+  --green:       #4ade80;
+  --green-soft:  rgba(74, 222, 128, 0.12);
+  --purple:      #a78bfa;
+  --purple-soft: rgba(167, 139, 250, 0.10);
+
+  /* Typography */
+  --text:        #e2e8f0;
+  --text-dim:    rgba(226, 232, 240, 0.45);
+  --text-muted:  rgba(226, 232, 240, 0.20);
+}
+
+/* ─── Reset & Base ──────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body, #root {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  background-color: var(--void);
+  color: var(--text);
+  font-family: 'DM Sans', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ─── Subtle noise texture background ──────────── */
+.bg-noise {
+  background-image:
+    radial-gradient(ellipse 80% 50% at 20% 10%, rgba(34,211,238,0.04) 0%, transparent 60%),
+    radial-gradient(ellipse 60% 40% at 80% 90%, rgba(167,139,250,0.04) 0%, transparent 60%),
+    url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.025'/%3E%3C/svg%3E");
+}
+
+/* ─── Glass card mixin ──────────────────────────── */
+.glass {
+  background: var(--card);
+  border: 1px solid var(--edge);
+  backdrop-filter: blur(16px);
+}
+
+/* ─── Glow utilities — lebih subtle ────────────── */
+.glow-cyan  { text-shadow: 0 0 24px rgba(34, 211, 238, 0.4); }
+.glow-amber { text-shadow: 0 0 24px rgba(251, 191, 36, 0.4); }
+.glow-red   { text-shadow: 0 0 24px rgba(248, 113, 113, 0.4); }
+.glow-green { text-shadow: 0 0 24px rgba(74, 222, 128, 0.4); }
+
+/* ─── Custom scrollbar ──────────────────────────── */
+.scroll-thin {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,0.08) transparent;
+}
+.scroll-thin::-webkit-scrollbar        { width: 3px; }
+.scroll-thin::-webkit-scrollbar-track  { background: transparent; }
+.scroll-thin::-webkit-scrollbar-thumb  { background: rgba(255,255,255,0.08); border-radius: 99px; }
+.scroll-thin::-webkit-scrollbar-thumb:hover { background: rgba(34,211,238,0.25); }
+
+/* ─── Live dot pulse ────────────────────────────── */
+.live-dot {
+  animation: livePulse 2s ease-in-out infinite;
+}
+@keyframes livePulse {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(34,211,238,0.5); }
+  50%       { opacity: 0.6; box-shadow: 0 0 0 6px rgba(34,211,238,0); }
+}
+
+/* ─── Scanline sweep (lebih subtle) ─────────────── */
+.scanline-wrap { position: relative; overflow: hidden; }
+.scanline-wrap::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  top: auto;
+  left: 0;
+  width: 100%;
+  height: 80px;
+  background: linear-gradient(
+    to bottom,
+    transparent 0%,
+    rgba(34, 211, 238, 0.018) 50%,
+    transparent 100%
+  );
+  animation: scanSweep 9s linear infinite;
+  pointer-events: none;
+  z-index: 6;
+}
+@keyframes scanSweep {
+  0%   { transform: translateY(-100vh); }
+  100% { transform: translateY(200vh); }
+}
+
+/* ─── Alert card entrance ───────────────────────── */
+.alert-enter {
+  animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  opacity: 0;
+}
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ─── Stat number entrance ──────────────────────── */
+.stat-enter {
+  animation: fadeScale 0.45s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  opacity: 0;
+}
+@keyframes fadeScale {
+  from { opacity: 0; transform: scale(0.88); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+/* ─── Violation card pulsing ────────────────────── */
+.violation-pulse {
+  animation: violationGlow 2.5s ease-in-out infinite;
+}
+@keyframes violationGlow {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.25); }
+  50%       { box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.6), 0 0 20px rgba(248, 113, 113, 0.12); }
+}
+
+/* ─── Wizard step animations ────────────────────── */
+.wizard-enter {
+  animation: wizardIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  opacity: 0;
+}
+@keyframes wizardIn {
+  from { opacity: 0; transform: translateY(16px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* ─── Shimmer loading effect ────────────────────── */
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255,255,255,0.04) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+}
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position:  200% 0; }
+}
+
+/* ─── Fade in ───────────────────────────────────── */
+.fade-in {
+  animation: fadeIn 0.5s ease forwards;
+}
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}

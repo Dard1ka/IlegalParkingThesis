@@ -1,0 +1,68 @@
+# ══════════════════════════════════════════════════════════════
+# .dockerignore — jangan copy file berat ke build context
+# ══════════════════════════════════════════════════════════════
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+
+# Node
+node_modules/
+parking-dashboard/node_modules/
+parking-dashboard/dist/
+npm-debug.log
+
+# Model & media besar (di-mount via volume, bukan copy)
+*.pt.zip
+*.zip
+input1.mp4
+input2.mp4
+input3.mp4
+# NOTE: input4.mp4 & *.pt tidak diignore di sini — nanti di-mount via compose
+# tapi kalau mau fully self-contained image, ignore-kan dan uncomment COPY di Dockerfile
+
+# Output & temp
+outputs/
+uploads/*.mp4
+uploads/*.avi
+
+# Notebook & script legacy (bukan bagian runtime)
+*.ipynb
+.ipynb_checkpoints/
+demo.py
+demo1.py
+demo2.py
+demo3.py
+demo3_andra.py
+demo3_tts - backup.py
+ColorVechicle/
+ColorVechicleAI_*.ipynb
+color_model/
+environments/
+gabungin_vehicle_and_segitiga/
+images/
+video/
+
+# IDE & VCS
+.git/
+.gitignore
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Docs
+docs/
+README.md
+SETUP.md
+LICENSE
+
+# Docker sendiri (hindari Docker-in-Docker)
+docker/

@@ -1,0 +1,66 @@
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# ── Virtual environments ───────────────────────────────────────
+environments/
+venv/
+env/
+.env
+.venv/
+ENV/
+
+# ── Model weights (too large for git — use Git LFS or releases) ─
+*.pt
+*.pth
+*.weights
+*.onnx
+
+# ── Video input files (too large) ─────────────────────────────
+input*.mp4
+input*.avi
+input*.mov
+video/
+
+# ── Output files ──────────────────────────────────────────────
+outputs/
+uploads/
+
+# ── TTS temp files ────────────────────────────────────────────
+outputs/tts_temp/
+
+# ── IDE & OS ──────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Frontend build ────────────────────────────────────────────
+parking-dashboard/node_modules/
+parking-dashboard/dist/
+parking-dashboard/.vite/
+
+# ── Jupyter notebooks output ──────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Archives ──────────────────────────────────────────────────
+*.zip
+*.tar.gz
+*.rar
+
+# ── Logs ──────────────────────────────────────────────────────
+*.log
