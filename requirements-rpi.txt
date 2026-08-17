@@ -1,0 +1,97 @@
+# ══════════════════════════════════════════════════════════════════════
+# Illegal Parking Detection System — Dependencies untuk RASPBERRY PI 4
+# ----------------------------------------------------------------------
+# Target : Raspberry Pi 4 Model B (64-bit, Cortex-A72 aarch64, 4 GB RAM)
+# OS     : Raspberry Pi OS Bookworm 64-bit  (Python 3.11)
+# Mode   : Backend penuh (FastAPI + YOLOv8) + optimasi NCNN/ONNX
+# Install : pip install -r requirements-rpi.txt
+#
+# PENTING — baca bagian "LANGKAH INSTALL" di paling bawah file ini dulu.
+# Beberapa paket (opencv, torch, ncnn) lebih baik lewat apt/piwheels
+# supaya tidak build dari source berjam-jam di Pi.
+# ══════════════════════════════════════════════════════════════════════
+
+# ── Computer Vision & AI (inti) ───────────────────────────────────────
+numpy>=1.26.0,<2.0            # <2.0 untuk kompatibilitas torch/opencv di ARM
+opencv-python>=4.9.0          # piwheels punya wheel prebuilt untuk aarch64
+ultralytics>=8.2.0            # YOLOv8 — deteksi kendaraan & segitiga
+
+# ── PyTorch (CPU-only, ARM64) ─────────────────────────────────────────
+# Pi 4 tidak punya GPU CUDA → pakai wheel CPU aarch64 dari PyPI.
+# Kalau `pip install torch` gagal/lambat, lihat LANGKAH INSTALL no.4.
+torch>=2.2.0
+torchvision>=0.17.0
+
+# ── Optimasi inferensi ARM (NCNN / ONNX) ──────────────────────────────
+# NCNN = backend tercepat untuk YOLOv8 di CPU ARM (rekomendasi Ultralytics).
+ncnn>=1.0.20240410           # runtime NCNN (dipakai model *_ncnn_model)
+onnx>=1.16.0                 # export & simpan model .onnx
+onnxruntime>=1.17.0          # inferensi ONNX di CPU ARM
+onnxslim>=0.1.28             # optimasi graph saat export (dipakai ultralytics)
+
+# ── Audio / TTS ───────────────────────────────────────────────────────
+edge-tts>=6.1.9              # Microsoft Edge TTS (suara Indonesia) — butuh internet
+pygame>=2.5.2               # pemutaran audio alert
+
+# ── Web Backend (mode dashboard) ──────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9      # dukungan upload file
+pydantic>=2.7.0
+
+# ── Utilities ─────────────────────────────────────────────────────────
+aiofiles>=23.2.1             # I/O file async
+
+
+# ══════════════════════════════════════════════════════════════════════
+# LANGKAH INSTALL DI RASPBERRY PI 4  (jalankan berurutan di terminal Pi)
+# ══════════════════════════════════════════════════════════════════════
+#
+# 1) Update sistem + dependency C untuk OpenCV / pygame / ffmpeg:
+#    sudo apt update && sudo apt upgrade -y
+#    sudo apt install -y python3-venv python3-pip \
+#         libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 libgomp1 \
+#         ffmpeg libatlas-base-dev libopenblas-dev \
+#         libsdl2-2.0-0 libsdl2-mixer-2.0-0 libportaudio2
+#
+# 2) Buat & aktifkan virtual environment (Python 3.11 bawaan Bookworm):
+#    python3 -m venv ~/parking-env
+#    source ~/parking-env/bin/activate
+#    pip install --upgrade pip wheel setuptools
+#
+# 3) Aktifkan piwheels supaya opencv/numpy dapat wheel prebuilt ARM
+#    (biasanya sudah aktif di Pi OS). Cek/isi /etc/pip.conf:
+#    [global]
+#    extra-index-url=https://www.piwheels.org/simple
+#
+# 4) Install semua dependency:
+#    pip install -r requirements-rpi.txt
+#
+#    Kalau torch gagal, install manual dulu lalu ulangi perintah di atas:
+#    pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#
+# 5) (Optimasi) Export model YOLO ke NCNN sekali saja di Pi, lalu pakai
+#    hasilnya di kode (jauh lebih cepat daripada .pt di CPU ARM):
+#    yolo export model=best.pt     format=ncnn
+#    yolo export model=triangle.pt format=ncnn
+#    # menghasilkan folder best_ncnn_model/ dan triangle_ncnn_model/
+#    # Alternatif ONNX:  yolo export model=best.pt format=onnx
+#
+# 6) Jalankan backend:
+#    uvicorn backend.main:app --host 0.0.0.0 --port 8000
+#
+# ── CATATAN KINERJA ───────────────────────────────────────────────────
+# • Pi 4 CPU-only: YOLOv8n ~ beberapa FPS. Pakai model *n* (nano) + NCNN.
+# • RAM 4 GB cukup untuk 1 model; hindari jalankan 2 model berat sekaligus.
+# • Tambah swap kalau OOM saat install/inferensi:
+#     sudo dphys-swapfile swapoff
+#     sudo sed -i 's/^CONF_SWAPSIZE=.*/CONF_SWAPSIZE=2048/' /etc/dphys-swapfile
+#     sudo dphys-swapfile setup && sudo dphys-swapfile swapon
+# • Turunkan resolusi input & set imgsz kecil (mis. 320/416) untuk FPS lebih baik.
+# • pygame tanpa audio device: alert TTS akan di-skip otomatis (aman).
+# ══════════════════════════════════════════════════════════════════════
+
+sudo dpkg --configure -a
+sudo apt --fix-broken install
+sudo apt update
+sudo apt full-upgrade

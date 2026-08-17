@@ -28,6 +28,14 @@ import edge_tts
 
 from .shared import SharedState
 
+# -- Koreksi orientasi kamera (video kebalik) --
+ROTATE_180 = True
+def _read_rot(cap):
+    ok, frame = cap.read()
+    if ok and ROTATE_180:
+        frame = cv2.rotate(frame, cv2.ROTATE_180)
+    return ok, frame
+
 
 # ══════════════════════════════════════════════════════════════
 # CONFIG  (sama persis dengan demo3_tts.py)
@@ -39,8 +47,8 @@ TRIANGLE_MODEL_PATH = "triangle.pt"
 PARKING_CHECK_SECONDS   = 60
 ILLEGAL_PARKING_SECONDS = 300
 
-VEHICLE_IMGSZ        = 960
-TRIANGLE_IMGSZ       = 640
+VEHICLE_IMGSZ        = 320
+TRIANGLE_IMGSZ       = 320
 VEHICLE_CONF         = 0.25
 TRIANGLE_CONF        = 0.20
 IOU                  = 0.50
@@ -608,7 +616,7 @@ class VideoProcessor:
         print(f"[PROC] Sumber terbuka: {W}×{H} @ {fps:.1f}fps")
 
         # 4. Baca frame pertama, simpan untuk ROI drawing di frontend
-        ret, first_frame = cap.read()
+        ret, first_frame = _read_rot(cap)
         if not ret:
             cap.release()
             return
@@ -645,7 +653,7 @@ class VideoProcessor:
                     print(f"[PROC] ROI diterima: {len(roi_polygons)} zona, {n} titik total")
                     break
 
-                ret, placeholder = cap.read()
+                ret, placeholder = _read_rot(cap)
                 if ret:
                     overlay = placeholder.copy()
                     cv2.putText(overlay, "Gambar zona larangan parkir di dashboard",
@@ -666,7 +674,7 @@ class VideoProcessor:
         # 6. Reset ke frame awal, baca frame pertama untuk loop
         if not is_camera:
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ret, current_frame = cap.read()
+            ret, current_frame = _read_rot(cap)
         else:
             current_frame = first_frame
         if not ret:
@@ -1008,7 +1016,7 @@ class VideoProcessor:
             tick_second += 1
             if is_camera:
                 # Kamera: baca frame berikutnya langsung
-                ret, current_frame = cap.read()
+                ret, current_frame = _read_rot(cap)
                 if not ret:
                     print("[PROC] Kamera gagal baca frame.")
                     break
@@ -1024,11 +1032,11 @@ class VideoProcessor:
                 else:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
 
-                ret, current_frame = cap.read()
+                ret, current_frame = _read_rot(cap)
                 if not ret:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     tick_second = 0
-                    ret, current_frame = cap.read()
+                    ret, current_frame = _read_rot(cap)
                     if not ret: break
 
         cap.release()
