@@ -1,68 +1,80 @@
 # ══════════════════════════════════════════════════════════════
 # .dockerignore — jangan copy file berat ke build context
+# ──────────────────────────────────────────────────────────────
+# Build context = root project (lihat docker/docker-compose.yml).
+# Pola TANPA awalan "**/" hanya cocok di root context.
+#
+# Yang di-COPY oleh Dockerfile (JANGAN di-ignore):
+#   requirements.txt, backend/, parking-dashboard/,
+#   docker/frontend/nginx.conf
 # ══════════════════════════════════════════════════════════════
 
 # Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
+**/__pycache__/
+**/*.py[cod]
 .Python
 venv/
 env/
 .venv/
-*.egg-info/
+environments/
+**/*.egg-info/
 
 # Node
-node_modules/
-parking-dashboard/node_modules/
+**/node_modules/
 parking-dashboard/dist/
-npm-debug.log
+**/npm-debug.log*
 
-# Model & media besar (di-mount via volume, bukan copy)
-*.pt.zip
-*.zip
-input1.mp4
-input2.mp4
-input3.mp4
-# NOTE: input4.mp4 & *.pt tidak diignore di sini — nanti di-mount via compose
-# tapi kalau mau fully self-contained image, ignore-kan dan uncomment COPY di Dockerfile
+# Environment lokal (jangan sampai ikut ter-bake ke image)
+**/.env
+**/.env.local
+**/.env.*.local
 
-# Output & temp
+# Model & media besar — di-mount via volume saat runtime, bukan di-COPY.
+# Meng-ignore di sini tidak memengaruhi bind mount di docker-compose.yml.
+**/*.pt
+**/*.pth
+**/*.onnx
+*_openvino_model/
+**/*.zip
+**/*.mp4
+**/*.avi
+**/*.mov
+**/*.mkv
+**/*.webm
+
+# Output & upload (di-mount saat runtime)
 outputs/
-uploads/*.mp4
-uploads/*.avi
+uploads/
 
-# Notebook & script legacy (bukan bagian runtime)
-*.ipynb
-.ipynb_checkpoints/
-demo.py
-demo1.py
-demo2.py
-demo3.py
-demo3_andra.py
-demo3_tts - backup.py
+# Notebook, script legacy & arsip (bukan bagian runtime)
+**/*.ipynb
+**/.ipynb_checkpoints/
+demo*.py
+generate_*.py
+backup-backend/
+Raspberry Pi/
 ColorVechicle/
-ColorVechicleAI_*.ipynb
 color_model/
-environments/
 gabungin_vehicle_and_segitiga/
 images/
 video/
+Contoh Thesis/
+Dapus Thesis/
+Sumber/
 
 # IDE & VCS
 .git/
 .gitignore
+.claude/
 .vscode/
 .idea/
-*.swp
-.DS_Store
+**/*.swp
+**/.DS_Store
 
 # Docs
 docs/
-README.md
-SETUP.md
+**/*.md
 LICENSE
 
-# Docker sendiri (hindari Docker-in-Docker)
-docker/
+# Folder docker/ sengaja TIDAK di-ignore: docker/frontend/Dockerfile
+# meng-COPY docker/frontend/nginx.conf dari build context.

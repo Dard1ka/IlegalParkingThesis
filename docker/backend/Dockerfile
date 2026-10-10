@@ -1,5 +1,6 @@
 # ══════════════════════════════════════════════════════════════
-# Backend Dockerfile — FastAPI + YOLOv8 + OpenCV
+# Backend Dockerfile — FastAPI + YOLO (Ultralytics) + OpenCV
+# Image ini CPU-only: PyTorch dipasang dari index CPU, tanpa wheel CUDA.
 # ══════════════════════════════════════════════════════════════
 FROM python:3.11-slim
 
@@ -23,24 +24,39 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     # Pygame tidak punya audio hardware di container → pakai dummy driver
     SDL_AUDIODRIVER=dummy \
-    # Ultralytics tidak perlu cek update online
+    # Driver dummy tidak bersuara → TTS default mati di Docker
+    # (nyalakan lewat docker/.env kalau audio host sudah diteruskan)
+    ENABLE_TTS=false \
+    # Ultralytics: tanpa cek online, telemetri, dan auto-install paket saat
+    # runtime. Aman karena semua dependency (termasuk lap) ada di requirements.txt
     YOLO_VERBOSE=False \
     YOLO_OFFLINE=True
 
 WORKDIR /app
 
+# ── PyTorch CPU-only (layer sendiri, sebelum requirements) ────
+# Di Linux, wheel torch bawaan PyPI adalah build CUDA yang ikut menarik
+# paket nvidia-* berukuran beberapa GB dan tidak terpakai tanpa GPU.
+# Index di bawah hanya berisi build CPU. Karena sudah terpasang lebih dulu,
+# `pip install -r` di layer berikutnya menganggap torch & torchvision sudah
+# terpenuhi (jangan tambahkan --upgrade di sana), dan mengubah
+# requirements.txt tidak lagi mengunduh ulang PyTorch.
+# Rentang versi torch harus sama dengan yang ada di requirements.txt.
+RUN pip install --upgrade pip && \
+    pip install --index-url https://download.pytorch.org/whl/cpu \
+        "torch>=2.0.0,<3" torchvision
+
 # ── Python deps (cache layer) ─────────────────────────────────
 COPY requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip && \
-    pip install -r /app/requirements.txt
+RUN pip install -r /app/requirements.txt
+
+# Folder runtime (akan di-mount dari host kalau user mau persist)
+RUN mkdir -p /app/uploads /app/outputs/tts_temp
 
 # ── App source ────────────────────────────────────────────────
 # Hanya backend code; model & video di-mount via volume supaya
 # image tetap ringan.
 COPY backend /app/backend
-
-# Folder runtime (akan di-mount dari host kalau user mau persist)
-RUN mkdir -p /app/uploads /app/outputs/tts_temp
 
 EXPOSE 8000
 

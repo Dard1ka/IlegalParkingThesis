@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-
-const API = 'http://localhost:8000'
+import { API_BASE } from '../config'
+import { useFirstFrame } from '../hooks/useFirstFrame'
+import { getImageRect, clientToNormalized, normalizedToCanvas } from '../lib/roiGeometry'
 
 // ─── Step indicator ───────────────────────────────────────────
 function StepDot({ active, done, label }) {
@@ -130,7 +131,7 @@ function StepSource({ onNext }) {
       try {
         const fd = new FormData()
         fd.append('file', videoFile)
-        const res = await fetch(`${API}/upload`, { method: 'POST', body: fd })
+        const res = await fetch(`${API_BASE}/upload`, { method: 'POST', body: fd })
         const data = await res.json()
         if (data.status !== 'ok') { setError(data.message || 'Upload gagal.'); return }
         onNext({ sourceType: 'video', path: data.path, filename: data.filename })
@@ -263,6 +264,25 @@ function StepSource({ onNext }) {
   )
 }
 
+// ─── POST /configure ──────────────────────────────────────────
+// Dipakai langkah Mode ROI dan tombol "Coba lagi" di langkah gambar zona.
+// Mengembalikan JSON jawaban backend ({ status, message?, ... }).
+async function sendConfigure(sourceInfo, roiMode) {
+  const body = {
+    source_type: sourceInfo.sourceType,
+    roi_mode:    roiMode,
+  }
+  if (sourceInfo.sourceType === 'video') body.path = sourceInfo.path
+  else body.camera_index = sourceInfo.camIndex
+
+  const res = await fetch(`${API_BASE}/configure`, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify(body),
+  })
+  return res.json()
+}
+
 // ─── Step 1: Pilih Mode ROI ───────────────────────────────────
 function StepROIMode({ sourceInfo, onNext, onBack }) {
   const [roiMode, setRoiMode] = useState(null)
@@ -274,19 +294,7 @@ function StepROIMode({ sourceInfo, onNext, onBack }) {
     setLoading(true)
     setError('')
     try {
-      const body = {
-        source_type: sourceInfo.sourceType,
-        roi_mode:    roiMode,
-      }
-      if (sourceInfo.sourceType === 'video') body.path = sourceInfo.path
-      else body.camera_index = sourceInfo.camIndex
-
-      const res = await fetch(`${API}/configure`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify(body),
-      })
-      const data = await res.json()
+      const data = await sendConfigure(sourceInfo, roiMode)
       if (data.status !== 'ok') { setError(data.message || 'Konfigurasi gagal.'); return }
 
       onNext({ roiMode })
@@ -358,12 +366,13 @@ function StepROIMode({ sourceInfo, onNext, onBack }) {
 }
 
 // ─── Canvas ROI drawing ───────────────────────────────────────
-function drawCanvas(canvas, allRois, currentPoints, imgW, imgH) {
+// imgRect = kotak frame yang benar-benar tampil di canvas (lihat lib/roiGeometry.js)
+function drawCanvas(canvas, allRois, currentPoints, imgRect) {
   const ctx = canvas.getContext('2d')
-  const W = canvas.width, H = canvas.height
-  ctx.clearRect(0, 0, W, H)
+  ctx.clearRect(0, 0, canvas.width, canvas.height)
+  if (!imgRect) return   // frame belum ada → belum ada yang bisa digambar
 
-  const toCanvas = (pts) => pts.map(p => ({ x: p.x * W, y: p.y * H }))
+  const toCanvas = (pts) => pts.map(p => normalizedToCanvas(p, imgRect))
 
   const colors = ['#22d3ee', '#fbbf24', '#4ade80', '#a78bfa', '#f87171']
 
@@ -426,63 +435,52 @@ function drawCanvas(canvas, allRois, currentPoints, imgW, imgH) {
 }
 
 // ─── Step 2: Gambar ROI Manual ────────────────────────────────
-function StepDrawROI({ onDone, onBack }) {
+function StepDrawROI({ sourceInfo, onDone, onBack }) {
   const canvasRef    = useRef(null)
   const containerRef = useRef(null)
+  const redrawRef    = useRef(null)                  // fungsi gambar terbaru, dibaca ResizeObserver
   const [allRois,    setAllRois]    = useState([])   // completed polygons
   const [current,    setCurrent]    = useState([])   // points being drawn
-  const [firstFrame, setFirstFrame] = useState(null)
-  const [loading,    setLoading]    = useState(true)
   const [saving,     setSaving]     = useState(false)
+  const [retrying,   setRetrying]   = useState(false) // "Coba lagi" sedang mengirim /configure
   const [error,      setError]      = useState('')
 
-  // Fetch first frame from backend
-  useEffect(() => {
-    let attempts = 0
-    const maxAttempts = 30
-    const poll = async () => {
-      try {
-        const res = await fetch(`${API}/first_frame`)
-        if (res.status === 204) {
-          if (attempts++ < maxAttempts) setTimeout(poll, 500)
-          return
-        }
-        const blob = await res.blob()
-        setFirstFrame(URL.createObjectURL(blob))
-        setLoading(false)
-      } catch {
-        if (attempts++ < maxAttempts) setTimeout(poll, 500)
-      }
-    }
-    poll()
-  }, [])
+  // Frame pertama milik sumber yang BARU dikonfigurasi (polling sampai siap)
+  const { frame, slow, procError, noSource, reload } = useFirstFrame()
+  const failed  = Boolean(procError) || noSource     // frame tidak akan datang
+  const loading = !frame && !failed
 
   const redraw = useCallback(() => {
     const c = canvasRef.current
-    if (c) drawCanvas(c, allRois, current)
-  }, [allRois, current])
-
-  useEffect(() => { redraw() }, [redraw])
+    if (!c) return
+    const imgRect = frame ? getImageRect(c.width, c.height, frame.width, frame.height) : null
+    drawCanvas(c, allRois, current, imgRect)
+  }, [allRois, current, frame])
 
   useEffect(() => {
-    const obs = new ResizeObserver(() => {
-      const c = canvasRef.current, d = containerRef.current
-      if (!c || !d) return
-      const r = d.getBoundingClientRect()
-      c.width = r.width; c.height = r.height
-      redraw()
-    })
-    if (containerRef.current) obs.observe(containerRef.current)
-    return () => obs.disconnect()
+    redrawRef.current = redraw
+    redraw()
   }, [redraw])
+
+  // ResizeObserver dibuat sekali saja (bukan tiap klik); fungsi gambar terbaru lewat ref
+  useEffect(() => {
+    const c = canvasRef.current, d = containerRef.current
+    if (!c || !d) return
+    const obs = new ResizeObserver(() => {
+      c.width = c.clientWidth; c.height = c.clientHeight
+      redrawRef.current?.()
+    })
+    obs.observe(d)
+    return () => obs.disconnect()
+  }, [])
 
   const handleClick = (e) => {
     const c = canvasRef.current
-    if (!c) return
-    const r = c.getBoundingClientRect()
-    const x = (e.clientX - r.left) / r.width
-    const y = (e.clientY - r.top) / r.height
-    setCurrent(prev => [...prev, { x, y }])
+    if (!c || !frame) return
+    // Dinormalisasi terhadap kotak GAMBAR (bukan kotak canvas), di-clamp ke 0..1
+    const p = clientToNormalized(e.clientX, e.clientY, c.getBoundingClientRect(), frame.width, frame.height)
+    if (!p) return
+    setCurrent(prev => [...prev, p])
     setError('')
   }
 
@@ -499,6 +497,23 @@ function StepDrawROI({ onDone, onBack }) {
 
   const clearAll = () => { setAllRois([]); setCurrent([]) }
 
+  // "Coba lagi": processor tidak membuka ulang sumber yang gagal dengan
+  // sendirinya, jadi konfigurasinya dikirim ulang dulu (POST /configure,
+  // isi sama dengan langkah Mode ROI) baru polling frame diulang.
+  const handleRetry = async () => {
+    setRetrying(true)
+    setError('')
+    try {
+      const data = await sendConfigure(sourceInfo, 'manual')
+      if (data.status !== 'ok') { setError(data.message || 'Konfigurasi gagal.'); return }
+      reload()
+    } catch {
+      setError('Gagal konek ke backend.')
+    } finally {
+      setRetrying(false)
+    }
+  }
+
   const handleSave = async () => {
     const finalRois = current.length >= 3 ? [...allRois, current] : allRois
     if (finalRois.length === 0) { setError('Gambar minimal 1 zona dulu ya!'); return }
@@ -507,7 +522,7 @@ function StepDrawROI({ onDone, onBack }) {
     setError('')
     try {
       const roisPayload = finalRois.map(roi => roi.map(p => [p.x, p.y]))
-      const res = await fetch(`${API}/set_roi`, {
+      const res = await fetch(`${API_BASE}/set_roi`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ rois: roisPayload }),
@@ -547,11 +562,17 @@ function StepDrawROI({ onDone, onBack }) {
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-3" style={{ zIndex: 5 }}>
             <div className="w-8 h-8 rounded-full border-2 border-t-transparent animate-spin" style={{ borderColor: 'var(--cyan)', borderTopColor: 'transparent' }} />
             <p className="text-xs" style={{ color: 'var(--text-dim)' }}>Mengambil frame pertama...</p>
+            {slow && (
+              <p className="text-[11px] text-center px-6 leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+                Backend masih membuka sumber videonya. Di komputer yang lambat ini bisa lama —
+                masih ditunggu, nggak perlu diulang.
+              </p>
+            )}
           </div>
         )}
-        {firstFrame && (
+        {frame && (
           <img
-            src={firstFrame}
+            src={frame.url}
             alt="First Frame"
             className="absolute inset-0 w-full h-full object-contain"
             style={{ zIndex: 1 }}
@@ -559,13 +580,47 @@ function StepDrawROI({ onDone, onBack }) {
         )}
         <canvas
           ref={canvasRef}
-          onClick={!loading ? handleClick : undefined}
+          onClick={frame ? handleClick : undefined}
           className="absolute inset-0 w-full h-full"
-          style={{ zIndex: 10, cursor: loading ? 'wait' : 'crosshair' }}
+          style={{ zIndex: 10, cursor: loading ? 'wait' : frame ? 'crosshair' : 'default' }}
         />
 
+        {/* Frame tidak akan datang (processor gagal membuka sumber, atau backend
+            belum punya sumber) → tampilkan penyebabnya + jalan keluar */}
+        {failed && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center" style={{ zIndex: 15 }}>
+            <div className="px-3 py-2 rounded-lg text-xs" style={{ background: 'var(--red-soft)', color: 'var(--red)', border: '1px solid rgba(248,113,113,0.2)' }}>
+              ⚠️ {procError
+                ? `Processor berhenti: ${procError}`
+                : 'Backend belum punya sumber video (mungkin baru di-restart).'}
+            </div>
+            <p className="text-xs" style={{ color: 'var(--text-dim)' }}>
+              {procError
+                ? 'Coba lagi kalau sumbernya sudah siap, atau balik buat ganti mode atau sumber.'
+                : 'Coba lagi buat kirim ulang konfigurasinya, atau balik buat ganti mode atau sumber.'}
+            </p>
+            <div className="flex gap-2">
+              <button
+                onClick={onBack}
+                className="py-2 px-4 rounded-xl text-xs transition-all"
+                style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid var(--edge)', color: 'var(--text-dim)' }}
+              >
+                ← Balik
+              </button>
+              <button
+                onClick={handleRetry}
+                disabled={retrying}
+                className="py-2 px-4 rounded-xl text-xs font-semibold transition-all disabled:opacity-30"
+                style={{ background: 'rgba(34,211,238,0.1)', border: '1px solid rgba(34,211,238,0.35)', color: 'var(--cyan)' }}
+              >
+                {retrying ? '⏳ Mengirim ulang...' : '↻ Coba lagi'}
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Floating hints */}
-        {!loading && current.length === 0 && allRois.length === 0 && (
+        {frame && current.length === 0 && allRois.length === 0 && (
           <div className="absolute top-3 left-1/2 -translate-x-1/2 pointer-events-none" style={{ zIndex: 15 }}>
             <div
               className="px-4 py-2 rounded-full text-xs whitespace-nowrap"
@@ -660,11 +715,9 @@ function StepDrawROI({ onDone, onBack }) {
 export default function SetupWizard({ onComplete }) {
   const [step,       setStep]       = useState(0)
   const [sourceInfo, setSourceInfo] = useState(null)
-  const [roiInfo,    setRoiInfo]    = useState(null)
 
   const handleSourceNext = (info) => { setSourceInfo(info); setStep(1) }
   const handleROIModeNext = (info) => {
-    setRoiInfo(info)
     if (info.roiMode === 'auto') {
       onComplete()   // auto mode → langsung ke dashboard
     } else {
@@ -674,7 +727,7 @@ export default function SetupWizard({ onComplete }) {
 
   return (
     <div
-      className="h-screen flex items-center justify-center bg-noise p-4"
+      className="h-screen flex items-center justify-center p-4"
       style={{ background: 'var(--void)' }}
     >
       <div
@@ -713,6 +766,7 @@ export default function SetupWizard({ onComplete }) {
           )}
           {step === 2 && (
             <StepDrawROI
+              sourceInfo={sourceInfo}
               onDone={onComplete}
               onBack={() => setStep(1)}
             />

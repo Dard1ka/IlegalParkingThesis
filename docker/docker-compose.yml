@@ -8,11 +8,24 @@
 #   - Dashboard : http://localhost:5173
 #   - API       : http://localhost:8000
 #   - API docs  : http://localhost:8000/docs
+#
+# Semua ${VAR:-default} bisa di-override lewat file docker/.env
+# (template: .env.example). Arti tiap variabel PARKING_* dijelaskan di
+# backend/README.md bagian "Environment Variables".
 # ══════════════════════════════════════════════════════════════
+
+# Rotasi log container, dipakai kedua service lewat `logging: *default-logging`.
+# Tanpa batas ini driver json-file menyimpan log tanpa henti dan lama-lama
+# memenuhi disk. Paling banyak 3 file x 10 MB per service; yang terlama dibuang.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
 
 services:
   # ────────────────────────────────────────────────────────────
-  # Backend — FastAPI + YOLOv8 + TTS
+  # Backend — FastAPI + YOLO + TTS
   # ────────────────────────────────────────────────────────────
   backend:
     build:
@@ -21,28 +34,69 @@ services:
     image: illegal-parking-backend:latest
     container_name: parking-backend
     restart: unless-stopped
+    logging: *default-logging
 
     ports:
       - "8000:8000"
 
     environment:
       - PYTHONUNBUFFERED=1
-      - SDL_AUDIODRIVER=${SDL_AUDIODRIVER:-dummy}   # "dummy" = silent, "alsa"/"pulse" kalau host Linux
-      - ENABLE_TTS=${ENABLE_TTS:-true}
       - TZ=${TZ:-Asia/Jakarta}
 
+      # ── Audio / TTS ──────────────────────────────────────────
+      # Container tidak punya perangkat audio (driver "dummy" = tanpa suara),
+      # jadi TTS default MATI supaya tidak mensintesis suara yang tidak
+      # terdengar. Untuk audio sungguhan (host Linux): teruskan audio host ke
+      # container, set SDL_AUDIODRIVER=pulse/alsa dan ENABLE_TTS=true di .env
+      # (lihat README.md bagian "TTS di dalam Container").
+      - SDL_AUDIODRIVER=${SDL_AUDIODRIVER:-dummy}
+      - ENABLE_TTS=${ENABLE_TTS:-false}
+
+      # ── Konfigurasi deteksi (default = default backend) ──────
+      - PARKING_VEHICLE_MODEL=${PARKING_VEHICLE_MODEL:-best.pt}
+      - PARKING_TRIANGLE_MODEL=${PARKING_TRIANGLE_MODEL:-triangle.pt}
+      - PARKING_VEHICLE_IMGSZ=${PARKING_VEHICLE_IMGSZ:-960}
+      - PARKING_TRIANGLE_IMGSZ=${PARKING_TRIANGLE_IMGSZ:-640}
+      - PARKING_TICK_STEP=${PARKING_TICK_STEP:-1}
+      # botsort.yaml = BoT-SORT bawaan Ultralytics (default backend).
+      # Opt-in: botsort_static.yaml (file bawaan backend, tanpa GMC) — bisa
+      # mengubah logical id / durasi sebagian kendaraan.
+      - PARKING_TRACKER=${PARKING_TRACKER:-botsort.yaml}
+
+      # Origin dashboard yang boleh memanggil API = alamat service frontend
+      # di bawah (port host 5173). Kalau dashboard dibuka dari perangkat lain,
+      # tambahkan http://<IP-host>:5173 lewat .env.
+      - PARKING_CORS_ORIGINS=${PARKING_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+
     volumes:
-      # Model weights — tidak di-copy ke image supaya ringan
-      - ../best.pt:/app/best.pt:ro
-      - ../triangle.pt:/app/triangle.pt:ro
-      # Video input (read-only, untuk testing)
-      - ../input4.mp4:/app/input4.mp4:ro
-      # Upload dir persistent
+      # Model weights — tidak di-copy ke image supaya ringan. Path-nya
+      # mengikuti PARKING_*_MODEL (relatif terhadap root project).
+      # create_host_path: false → compose langsung error kalau model belum
+      # ada, bukan diam-diam membuat FOLDER kosong bernama best.pt di host.
+      - type: bind
+        source: ../${PARKING_VEHICLE_MODEL:-best.pt}
+        target: /app/${PARKING_VEHICLE_MODEL:-best.pt}
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ../${PARKING_TRIANGLE_MODEL:-triangle.pt}
+        target: /app/${PARKING_TRIANGLE_MODEL:-triangle.pt}
+        read_only: true
+        bind:
+          create_host_path: false
+      # Upload dir persistent (video dikirim dari dashboard lewat POST /upload)
       - ../uploads:/app/uploads
-      # TTS temp
+      # Cache audio TTS (outputs/tts_temp): tetap ada saat container dibuat ulang
       - ../outputs:/app/outputs
 
-    # GPU support (aktifkan kalau host punya NVIDIA + nvidia-container-toolkit)
+    # Kamera (hanya host Linux): teruskan perangkat V4L2 ke container.
+    # Di Docker Desktop Windows/Mac webcam tidak bisa diteruskan — untuk mode
+    # kamera jalankan backend secara native (lihat README.md).
+    # devices:
+    #   - /dev/video0:/dev/video0
+
+    # GPU support (image default CPU-only; langkah lengkap ada di README.md)
     # deploy:
     #   resources:
     #     reservations:
@@ -61,9 +115,14 @@ services:
     build:
       context: ..
       dockerfile: docker/frontend/Dockerfile
+      args:
+        # Alamat backend yang di-bake ke bundle SAAT BUILD. Kosong = otomatis
+        # http://<hostname halaman dashboard>:8000, cocok dengan port di atas.
+        VITE_API_BASE: ${VITE_API_BASE:-}
     image: illegal-parking-frontend:latest
     container_name: parking-frontend
     restart: unless-stopped
+    logging: *default-logging
 
     ports:
       - "5173:80"

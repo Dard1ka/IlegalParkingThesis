@@ -3,8 +3,8 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Version-1.0_(Prototype)-blue?style=flat-square"/>
   <img src="https://img.shields.io/badge/Status-Active_Development-orange?style=flat-square"/>
-  <img src="https://img.shields.io/badge/Python-3.9%2B-3776AB?style=flat-square&logo=python&logoColor=white"/>
-  <img src="https://img.shields.io/badge/YOLOv8-Ultralytics-00FFAA?style=flat-square"/>
+  <img src="https://img.shields.io/badge/Python-3.11-3776AB?style=flat-square&logo=python&logoColor=white"/>
+  <img src="https://img.shields.io/badge/YOLO11-Ultralytics-00FFAA?style=flat-square"/>
   <img src="https://img.shields.io/badge/FastAPI-0.111-009688?style=flat-square&logo=fastapi&logoColor=white"/>
   <img src="https://img.shields.io/badge/React-18.3-61DAFB?style=flat-square&logo=react&logoColor=black"/>
   <img src="https://img.shields.io/badge/TailwindCSS-3.4-38BDF8?style=flat-square&logo=tailwindcss&logoColor=white"/>
@@ -13,8 +13,8 @@
 </p>
 
 <p align="center">
-  <b>AI-powered illegal parking detection with live dashboard, multi-zone ROI, and Indonesian TTS alerts.</b><br/>
-  Detects, tracks, and alerts on vehicles parked in restricted zones using YOLOv8 object detection and BotSORT multi-object tracking.
+  <b>Real-time AI-powered illegal parking detection with live dashboard, multi-zone ROI, and Indonesian TTS alerts.</b><br/>
+  Detects, tracks, and alerts on vehicles parked in restricted zones using YOLO11 object detection and BotSORT multi-object tracking.
 </p>
 
 > [!NOTE]
@@ -32,7 +32,7 @@
 
 | Feature | Description |
 |---|---|
-| 🎯 **Vehicle Detection** | YOLOv8 detects car, bus, truck, motorcycle with 96px input resolution |
+| 🎯 **Vehicle Detection** | YOLO11m detects car, bus, truck, motorcycle at 960px input resolution (configurable via `PARKING_VEHICLE_IMGSZ`) |
 | 🔄 **Multi-Object Tracking** | BotSORT tracker with logical ID re-linking across occlusions (up to 80s) |
 | 🗺️ **Multi-Zone ROI** | Draw multiple no-parking polygon zones via interactive dashboard |
 | ⚠️ **3-Stage Alert System** | Monitoring → Warning (60s) → Violation (300s) |
@@ -65,7 +65,7 @@
 │  ┌──────────────┐  ┌─────────────────────────────────────┐  │
 │  │  SharedState │  │         VideoProcessor               │  │
 │  │  (thread-    │←→│  ┌──────────┐  ┌─────────────────┐  │  │
-│  │   safe)      │  │  │ YOLOv8   │  │  BotSORT        │  │  │
+│  │   safe)      │  │  │ YOLO11m  │  │  BotSORT        │  │  │
 │  └──────────────┘  │  │ Vehicle  │  │  Tracker +      │  │  │
 │                    │  │ Detection│  │  Re-linking      │  │  │
 │                    │  └──────────┘  └─────────────────┘  │  │
@@ -85,19 +85,40 @@
 
 ```
 Frame → YOLO Track → Filter by ROI → Assignment Logic
-     → Stationary Check (3s) → Parked State
+     → Color Classify (first time the vehicle is seen)
+     → Stationary Check (3s) → Parked State → Color Classify (once more)
      → 60s: Triangle Check → Warning
-     → 300s: Color Classify → TTS Alert → Violation
+     → 300s: TTS Alert → Violation
 ```
+
+Warna diklasifikasi saat kendaraan pertama kali terlihat dan sekali lagi saat kendaraan mulai dianggap parkir, jadi label warna sudah tampil di dashboard jauh sebelum ambang 300 detik.
 
 ---
 
 ## 🚀 Quick Start
 
+### Option A — Standalone Script (no dashboard)
+
 ```bash
-# Terminal 1: Backend
+# 1. Clone & install
+git clone https://github.com/YOUR_USERNAME/illegal-parking-detection.git
+cd illegal-parking-detection
 pip install -r requirements.txt
-uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
+
+# 2. Place model files (see Models section)
+# best.pt → vehicle detection
+# triangle.pt → warning triangle detection
+
+# 3. Run with environment check
+python demo_quickstart.py --video input4.mp4
+```
+
+### Option B — Full Dashboard (recommended)
+
+```bash
+# Terminal 1: Backend (run from the project root)
+pip install -r requirements.txt
+uvicorn backend.main:app --host 0.0.0.0 --port 8000
 
 # Terminal 2: Frontend
 cd parking-dashboard
@@ -106,13 +127,19 @@ npm run dev
 # Open http://localhost:5173
 ```
 
+> Perintah di atas sengaja **tanpa** `--reload` (untuk pemakaian biasa, demo, dan mini PC). Hot-reload hanya untuk development — lihat bagian "Development" di bawah.
+>
+> Model, ukuran input, tracker, CORS, dan TTS bisa diatur lewat environment variable tanpa mengubah kode: lihat tabel di [`backend/README.md`](backend/README.md#environment-variables).
+>
+> **PC lambat / mini PC tanpa GPU** (mis. Intel Core i5-2400): ukur dulu kecepatannya di mesin itu dengan `python tools/benchmark_inference.py`, lalu ikuti [`SETUP.md` → Menjalankan di PC Lambat](SETUP.md#7-menjalankan-di-pc-lambat-cpu-lama-tanpa-avx2).
+
 ---
 
 ## 📋 Prerequisites
 
 | Requirement | Version | Notes |
 |---|---|---|
-| Python | 3.9+ | Tested on 3.10, 3.11 |
+| Python | 3.11 | Versi yang dipakai venv development dan image Docker |
 | Node.js | 18+ | For dashboard frontend |
 | CUDA (optional) | 11.8+ | GPU acceleration for YOLO |
 | RAM | 8GB+ | 16GB recommended |
@@ -128,31 +155,40 @@ Repository ini menggunakan arsitektur **monorepo** — seluruh komponen (backend
 illegal-parking-detection/
 │
 ├── README.md                 # Dokumentasi utama (file ini)
+├── SETUP.md                  # Panduan instalasi, troubleshooting, PC lambat
 ├── requirements.txt          # Python dependencies
 ├── .gitignore                # File/folder yang tidak di-track git
 ├── LICENSE                   # MIT License
 │
 ├── demo3_tts.py              # Standalone detection script (algoritma utama)
 ├── demo_quickstart.py        # Quick-start wrapper dengan environment check
-├── best.pt                   # YOLOv8 vehicle detection model *
+├── best.pt                   # YOLO11m vehicle detection model *
 ├── triangle.pt               # YOLOv8 warning triangle model *
 │
 ├── backend/                  # FastAPI web backend (lihat backend/README.md)
 │   ├── __init__.py
 │   ├── main.py               # API endpoints & lifespan management
 │   ├── processor.py          # VideoProcessor — inti deteksi & tracking
-│   └── shared.py             # Thread-safe SharedState antar thread
+│   ├── shared.py             # Thread-safe SharedState antar thread
+│   └── botsort_static.yaml   # Tracker opsional (BoT-SORT tanpa GMC, opt-in)
+│
+├── tools/                    # Skrip bantu (bukan bagian runtime)
+│   └── benchmark_inference.py  # Ukur detik/tick di mesin target (lihat SETUP.md)
 │
 ├── parking-dashboard/        # React frontend (lihat parking-dashboard/README.md)
 │   ├── src/
 │   │   ├── App.jsx           # Root: state machine setup ↔ dashboard
+│   │   ├── config.js         # Alamat backend (API_BASE, WS_URL, STREAM_URL)
 │   │   ├── index.css         # Design system & animasi
 │   │   ├── components/
 │   │   │   ├── SetupWizard.jsx   # Onboarding wizard 3 langkah
 │   │   │   ├── VideoMonitor.jsx  # MJPEG stream viewer + ROI editor
 │   │   │   └── AlertSidebar.jsx  # Feed alert real-time
-│   │   └── hooks/
-│   │       └── useAlerts.js  # WebSocket hook dengan auto-reconnect
+│   │   ├── hooks/
+│   │   │   ├── useAlerts.js      # WebSocket hook dengan auto-reconnect
+│   │   │   └── useFirstFrame.js  # Ambil frame pertama (GET /first_frame)
+│   │   └── lib/
+│   │       └── roiGeometry.js    # Geometri editor zona (klik → koordinat ternormalisasi)
 │   ├── package.json
 │   ├── tailwind.config.js
 │   └── vite.config.js
@@ -180,11 +216,11 @@ illegal-parking-detection/
 |---|---|---|
 | `POST` | `/upload` | Upload video file (MP4, AVI, MOV, MKV, WebM) |
 | `POST` | `/configure` | Set source (video/camera) and ROI mode (manual/auto) |
-| `GET` | `/first_frame` | Get first frame as JPEG for ROI drawing |
+| `GET` | `/first_frame` | Get first frame of the newly configured source as JPEG for ROI drawing (`204` until it is ready) |
 | `POST` | `/set_roi` | Set multi-polygon no-parking zones |
 | `GET` | `/video_feed` | MJPEG video stream |
-| `WS` | `/ws/alerts` | Real-time alert + stats WebSocket |
-| `GET` | `/status` | Processor status + current stats |
+| `WS` | `/ws/alerts` | Real-time alert + stats + processor status WebSocket |
+| `GET` | `/status` | Processor status (`proc`) + current stats |
 | `GET` | `/docs` | Auto-generated FastAPI Swagger UI |
 
 ### ROI Payload Format
@@ -221,13 +257,23 @@ Coordinates are normalized `[0, 1]` relative to frame dimensions.
     "warning": 1,
     "violation": 1,
     "safe": 1
+  },
+  "proc": {
+    "state": "running",
+    "tick": 312,
+    "tick_ms": 850.3,
+    "error": null
   }
 }
 ```
 
+`proc` is the processor status (`state`: `loading_models`, `waiting_source`, `opening_source`, `waiting_roi`, `running`, `error`, `stopped`). The values above only illustrate the shape; field details are in [`backend/README.md`](backend/README.md#status-processor-proc).
+
 ---
 
 ## ⚙️ Configuration
+
+Untuk backend dashboard, model, ukuran input (`imgsz`), langkah tick video, tracker, CORS, dan TTS diatur lewat **environment variable** — daftar lengkap beserta default dan contoh perintah Windows (cmd / PowerShell) ada di [`backend/README.md`](backend/README.md#environment-variables). Default-nya sama dengan nilai di bawah.
 
 Key parameters in `demo3_tts.py` / `backend/processor.py`:
 
@@ -291,7 +337,7 @@ Vehicles hidden for up to 80 seconds maintain their full state (`ParkedRecord`) 
 
 | Model | Architecture | Task | Input Size |
 |---|---|---|---|
-| `best.pt` | YOLOv8 (custom) | Vehicle detection | 960px |
+| `best.pt` | YOLO11m (custom, needs `ultralytics>=8.3.0`) | Vehicle detection | 960px |
 | `triangle.pt` | YOLOv8n (custom) | Warning triangle | 640px |
 
 Both models were trained on custom datasets. See `VehicleDetection.ipynb` and `WarningTriangleYOLOv8.ipynb` for training details.
@@ -307,8 +353,8 @@ Both models were trained on custom datasets. See `VehicleDetection.ipynb` and `W
 ## 🛠️ Development
 
 ```bash
-# Backend (hot reload)
-uvicorn backend.main:app --reload --port 8000
+# Backend (hot reload) — run from the project root; only backend/ is watched
+uvicorn backend.main:app --port 8000 --reload --reload-dir backend
 
 # Frontend (hot reload)
 cd parking-dashboard && npm run dev
@@ -316,6 +362,8 @@ cd parking-dashboard && npm run dev
 # Standalone (no dashboard)
 python demo_quickstart.py --video input4.mp4 --no-tts
 ```
+
+> Tanpa `--reload-dir backend`, uvicorn memantau seluruh root project (termasuk `environments/` dan `demo*.py`): setiap file `.py` yang berubah me-restart backend dan menghapus state tracking.
 
 ---
 
@@ -333,7 +381,9 @@ docker compose up --build
 # API docs  : http://localhost:8000/docs
 ```
 
-Lihat [`docker/README.md`](docker/README.md) untuk detail konfigurasi, GPU support, dan troubleshooting.
+Image backend bersifat CPU-only, dan di Docker TTS default-nya mati (`ENABLE_TTS=false`) karena container tidak punya perangkat audio. Mode kamera tidak tersedia di Docker Desktop Windows/Mac — jalankan secara native untuk itu.
+
+Lihat [`docker/README.md`](docker/README.md) untuk detail konfigurasi (`.env`), GPU support, kamera, dan troubleshooting.
 
 ---
 
@@ -343,9 +393,10 @@ Setiap komponen utama memiliki README tersendiri dengan penjelasan detail:
 
 | Komponen | Dokumentasi | Deskripsi |
 |---|---|---|
-| Backend API | [`backend/README.md`](backend/README.md) | Arsitektur FastAPI, modul processor & shared state, endpoint reference |
-| Frontend Dashboard | [`parking-dashboard/README.md`](parking-dashboard/README.md) | Komponen React, flow UI, design system |
-| Docker Setup | [`docker/README.md`](docker/README.md) | Docker Compose, volume mount, GPU support, TTS config |
+| Backend API | [`backend/README.md`](backend/README.md) | Arsitektur FastAPI, modul processor & shared state, endpoint reference, **tabel environment variable** |
+| Frontend Dashboard | [`parking-dashboard/README.md`](parking-dashboard/README.md) | Komponen React, flow UI, design system, alamat backend (`VITE_API_BASE`) |
+| Docker Setup | [`docker/README.md`](docker/README.md) | Docker Compose, `.env`, volume mount, GPU support, TTS & kamera |
+| Instalasi & PC lambat | [`SETUP.md`](SETUP.md) | Instalasi langkah demi langkah, troubleshooting, dan [panduan PC lambat](SETUP.md#7-menjalankan-di-pc-lambat-cpu-lama-tanpa-avx2) (benchmark, `PARKING_TICK_STEP`, model ONNX) |
 
 ---
 

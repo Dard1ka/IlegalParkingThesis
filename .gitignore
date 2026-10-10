@@ -40,6 +40,9 @@ uploads/
 # ── TTS temp files ────────────────────────────────────────────
 outputs/tts_temp/
 
+# ── Benchmark results (tools/benchmark_inference.py) ──────────
+benchmark_inference_*.json
+
 # ── IDE & OS ──────────────────────────────────────────────────
 .vscode/
 .idea/

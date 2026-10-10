@@ -1,7 +1,9 @@
-import { useRef, useState, useEffect, useCallback } from 'react'
+import { memo, useRef, useState, useEffect, useCallback } from 'react'
+import { API_BASE, STREAM_URL } from '../config'
+import { useFirstFrame } from '../hooks/useFirstFrame'
+import { getImageRect, clientToNormalized, normalizedToCanvas } from '../lib/roiGeometry'
 
-const STREAM_URL = 'http://localhost:8000/video_feed'
-const API        = 'http://localhost:8000'
+const STREAM_RETRY_DELAY = 3000   // ms sebelum mencoba menyambung ulang stream
 
 // ─── Corner brackets ──────────────────────────────────────────
 function Corners() {
@@ -64,13 +66,15 @@ function OfflinePlaceholder() {
 function ROIUpdatePanel({ onClose }) {
   const canvasRef    = useRef(null)
   const containerRef = useRef(null)
-  const imgRef       = useRef(null)
+  const redrawRef    = useRef(null)   // fungsi gambar terbaru, dibaca ResizeObserver
 
   const [points,   setPoints]   = useState([])
   const [allRois,  setAllRois]  = useState([])
   const [saving,   setSaving]   = useState(false)
   const [result,   setResult]   = useState(null)
-  const [imgLoaded, setImgLoaded] = useState(false)
+
+  // Frame diambil SEKALI saat panel dibuka (bukan tiap render)
+  const { frame, slow, procError, noSource } = useFirstFrame()
 
   const COLORS = ['#22d3ee', '#fbbf24', '#4ade80', '#a78bfa']
 
@@ -78,10 +82,13 @@ function ROIUpdatePanel({ onClose }) {
     const c = canvasRef.current
     if (!c) return
     const ctx = c.getContext('2d')
-    const W = c.width, H = c.height
-    ctx.clearRect(0, 0, W, H)
+    ctx.clearRect(0, 0, c.width, c.height)
 
-    const toC = pts => pts.map(p => ({ x: p.x * W, y: p.y * H }))
+    // Kotak frame yang benar-benar tampil di canvas (lihat lib/roiGeometry.js)
+    const imgRect = frame ? getImageRect(c.width, c.height, frame.width, frame.height) : null
+    if (!imgRect) return
+
+    const toC = pts => pts.map(p => normalizedToCanvas(p, imgRect))
 
     allRois.forEach((roi, idx) => {
       const px = toC(roi)
@@ -112,25 +119,32 @@ function ROIUpdatePanel({ onClose }) {
         ctx.fillStyle = i === 0 ? '#fbbf24' : '#22d3ee'; ctx.fill()
       })
     }
-  }, [allRois, points])
-
-  useEffect(() => { redraw() }, [redraw])
+  }, [allRois, points, frame])
 
   useEffect(() => {
-    const obs = new ResizeObserver(() => {
-      const c = canvasRef.current, d = containerRef.current
-      if (!c || !d) return
-      const r = d.getBoundingClientRect()
-      c.width = r.width; c.height = r.height; redraw()
-    })
-    if (containerRef.current) obs.observe(containerRef.current)
-    return () => obs.disconnect()
+    redrawRef.current = redraw
+    redraw()
   }, [redraw])
 
+  // ResizeObserver dibuat sekali saja (bukan tiap klik); fungsi gambar terbaru lewat ref
+  useEffect(() => {
+    const c = canvasRef.current, d = containerRef.current
+    if (!c || !d) return
+    const obs = new ResizeObserver(() => {
+      c.width = c.clientWidth; c.height = c.clientHeight
+      redrawRef.current?.()
+    })
+    obs.observe(d)
+    return () => obs.disconnect()
+  }, [])
+
   const handleClick = e => {
-    const c = canvasRef.current; if (!c) return
-    const r = c.getBoundingClientRect()
-    setPoints(prev => [...prev, { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height }])
+    const c = canvasRef.current
+    if (!c || !frame) return
+    // Dinormalisasi terhadap kotak GAMBAR (bukan kotak canvas), di-clamp ke 0..1
+    const p = clientToNormalized(e.clientX, e.clientY, c.getBoundingClientRect(), frame.width, frame.height)
+    if (!p) return
+    setPoints(prev => [...prev, p])
     setResult(null)
   }
 
@@ -145,7 +159,7 @@ function ROIUpdatePanel({ onClose }) {
     if (final.length === 0) { setResult({ ok: false, msg: 'Gambar minimal 1 zona.' }); return }
     setSaving(true)
     try {
-      const res = await fetch(`${API}/set_roi`, {
+      const res = await fetch(`${API_BASE}/set_roi`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ rois: final.map(r => r.map(p => [p.x, p.y])) }),
       })
@@ -176,20 +190,50 @@ function ROIUpdatePanel({ onClose }) {
       </div>
 
       <div ref={containerRef} className="relative flex-1 rounded-xl overflow-hidden" style={{ background: '#000', border: '1px solid var(--edge)', minHeight: 0 }}>
-        <img
-          ref={imgRef}
-          src={`${API}/first_frame?t=${Date.now()}`}
-          alt="frame"
-          className="absolute inset-0 w-full h-full object-contain"
-          style={{ zIndex: 1 }}
-          onLoad={() => setImgLoaded(true)}
-        />
+        {frame && (
+          <img
+            src={frame.url}
+            alt="frame"
+            className="absolute inset-0 w-full h-full object-contain"
+            style={{ zIndex: 1 }}
+          />
+        )}
         <canvas
           ref={canvasRef}
-          onClick={handleClick}
-          className="absolute inset-0 w-full h-full cursor-crosshair"
+          onClick={frame ? handleClick : undefined}
+          className={`absolute inset-0 w-full h-full ${frame ? 'cursor-crosshair' : 'cursor-default'}`}
           style={{ zIndex: 10 }}
         />
+
+        {/* Frame belum ada: backend masih menyiapkannya, atau frame tidak akan
+            datang (processor melapor error / backend belum punya sumber).
+            Panel ini tidak menyimpan konfigurasi sumber dan processor tidak
+            mencoba ulang sendiri, jadi jalan keluarnya lewat "Ganti Setup". */}
+        {!frame && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 px-6 text-center" style={{ zIndex: 15 }}>
+            {(procError || noSource) ? (
+              <>
+                <p className="text-xs" style={{ color: 'var(--red)' }}>
+                  ⚠️ {procError
+                    ? `Processor berhenti: ${procError}`
+                    : 'Backend belum punya sumber video (mungkin baru di-restart).'}
+                </p>
+                <p className="text-[11px] leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+                  Klik ⚙ Ganti Setup di kanan atas untuk mengonfigurasi ulang sumbernya.
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="text-xs" style={{ color: 'var(--text-dim)' }}>Mengambil frame...</p>
+                {slow && (
+                  <p className="text-[11px] leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+                    Backend masih membuka sumber videonya — masih ditunggu.
+                  </p>
+                )}
+              </>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="shrink-0 flex gap-2">
@@ -225,10 +269,52 @@ function ROIUpdatePanel({ onClose }) {
 }
 
 // ─── Main component ───────────────────────────────────────────
-export default function VideoMonitor() {
-  const containerRef = useRef(null)
+// Props (semua opsional):
+//   connected  — status WebSocket, dipakai untuk menyambung ulang stream
+//   procError  — pesan error processor (null = normal)
+//   tickLabel  — teks lama proses tick terakhir, mis. "2,4 dtk/tick"
+function VideoMonitor({ connected = false, procError = null, tickLabel = null }) {
+  const imgRef       = useRef(null)
+  const retryTimer   = useRef(null)    // timer sambung ulang stream
+  const wasConnected = useRef(false)   // WebSocket sudah pernah tersambung?
   const [streamOk,    setStreamOk]    = useState(false)
   const [showUpdate,  setShowUpdate]  = useState(false)
+
+  // Pasang ulang src → browser membuka koneksi MJPEG baru. Parameter `r` hanya
+  // membuat URL-nya berbeda dari yang gagal; backend mengabaikannya.
+  const reconnectStream = useCallback(() => {
+    clearTimeout(retryTimer.current)
+    retryTimer.current = null
+    if (imgRef.current) imgRef.current.src = `${STREAM_URL}?r=${Date.now()}`
+  }, [])
+
+  // src dipasang lewat effect (bukan atribut JSX) supaya koneksi MJPEG
+  // benar-benar ditutup saat komponen di-unmount (mis. "Ganti Setup").
+  useEffect(() => {
+    const img = imgRef.current
+    img.src = STREAM_URL
+    return () => {
+      clearTimeout(retryTimer.current)
+      retryTimer.current = null
+      img.removeAttribute('src')
+    }
+  }, [])
+
+  // <img> gagal memuat stream → coba lagi setelah jeda, jangan dibiarkan rusak
+  const handleStreamError = () => {
+    setStreamOk(false)
+    if (retryTimer.current) return
+    retryTimer.current = setTimeout(reconnectStream, STREAM_RETRY_DELAY)
+  }
+
+  // Event error <img> tidak dijamin muncul saat stream terputus (mis. backend
+  // di-restart: gambarnya hanya membeku). Begitu WebSocket tersambung LAGI,
+  // stream ikut disambung ulang.
+  useEffect(() => {
+    if (!connected) return
+    if (wasConnected.current) reconnectStream()
+    wasConnected.current = true
+  }, [connected, reconnectStream])
 
   return (
     <div className="flex flex-col h-full gap-2">
@@ -249,6 +335,15 @@ export default function VideoMonitor() {
           >
             {streamOk ? '● Streaming' : '○ Standby'}
           </span>
+          {tickLabel && (
+            <span
+              className="text-[10px] font-mono"
+              style={{ color: 'var(--text-muted)' }}
+              title="Lama proses tick terakhir di backend"
+            >
+              {tickLabel}
+            </span>
+          )}
         </div>
 
         <button
@@ -266,7 +361,6 @@ export default function VideoMonitor() {
 
       {/* Video + overlay */}
       <div
-        ref={containerRef}
         className="relative flex-1 rounded-2xl scanline-wrap"
         style={{
           background: '#000',
@@ -276,17 +370,33 @@ export default function VideoMonitor() {
         }}
       >
         <img
-          src={STREAM_URL}
+          ref={imgRef}
           alt="Live Feed"
           className="absolute inset-0 w-full h-full object-contain"
           style={{ zIndex: 1 }}
           onLoad={() => setStreamOk(true)}
-          onError={() => setStreamOk(false)}
+          onError={handleStreamError}
         />
 
         {!streamOk && <OfflinePlaceholder />}
 
         <Corners />
+
+        {/* Processor berhenti / melapor error */}
+        {procError && (
+          <div
+            role="alert"
+            className="absolute top-3 left-3 right-3 px-3 py-2 rounded-xl text-xs font-semibold break-words"
+            style={{
+              background: 'linear-gradient(var(--red-soft), var(--red-soft)), rgba(8,9,15,0.92)',
+              border: '1px solid rgba(248,113,113,0.5)',
+              color: 'var(--red)',
+              zIndex: 25,
+            }}
+          >
+            ⚠️ Processor berhenti: {procError}
+          </div>
+        )}
 
         {/* Update ROI panel */}
         {showUpdate && <ROIUpdatePanel onClose={() => setShowUpdate(false)} />}
@@ -294,3 +404,7 @@ export default function VideoMonitor() {
     </div>
   )
 }
+
+// memo: Dashboard render ulang tiap pesan WebSocket, sedangkan komponen ini
+// hanya perlu ikut render kalau props-nya (semuanya nilai primitif) berubah.
+export default memo(VideoMonitor)

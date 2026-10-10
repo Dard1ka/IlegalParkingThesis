@@ -1,23 +1,61 @@
 # ══════════════════════════════════════════════════════════════
 # Illegal Parking Detection System — Python Dependencies
-# Python 3.9+ required
+# Python 3.11 (the version used by the dev venv and the Docker image)
 # Install: pip install -r requirements.txt
+#
+# Every range has an upper bound so that a future major release
+# cannot break a fresh install. Versions known to install and start
+# the backend:
+#   dev laptop (venv)   : torch 2.10.0+cpu, ultralytics 8.4.18, numpy 2.4.2,
+#                         opencv-python 4.13.0.92, fastapi 0.136.0,
+#                         uvicorn 0.44.0, pydantic 2.13.2, lap 0.5.13
+#   mini PC (fresh pip) : torch 2.14.1, ultralytics 8.4.174, numpy 2.4.6,
+#                         opencv-python 5.0.0.93, fastapi 0.143.0,
+#                         uvicorn 0.54.0, pydantic 2.14.0
+# best.pt was trained with ultralytics 8.4.36.
 # ══════════════════════════════════════════════════════════════
 
 # ── Computer Vision & AI ──────────────────────────────────────
-opencv-python>=4.9.0
-numpy>=1.26.0
-ultralytics>=8.2.0          # YOLOv8 — vehicle & triangle detection
+opencv-python>=4.9.0,<6
+numpy>=1.26.0,<3
+ultralytics>=8.3.0,<9       # best.pt is a YOLO11m model — YOLO11 needs >=8.3.0
+
+# torch is pulled in by ultralytics; listed only to cap it below torch 3.
+# Windows: the PyPI wheel is CPU-only. Linux: the PyPI wheel is the CUDA
+# build — for a CPU-only machine install the CPU wheel first:
+#   pip install "torch>=2.0.0,<3" torchvision --index-url https://download.pytorch.org/whl/cpu
+# (docker/backend/Dockerfile does exactly that; keep both ranges in sync.)
+torch>=2.0.0,<3
+
+# Tracker (BoT-SORT / ByteTrack) assignment solver. Without it Ultralytics
+# tries a runtime `pip install` on the first tick, which needs internet and
+# fails when the machine is offline (or when YOLO_OFFLINE=true).
+lap>=0.5.12,<1
 
 # ── Audio / TTS ───────────────────────────────────────────────
-edge-tts>=6.1.9             # Microsoft Edge TTS (Indonesian voice)
-pygame>=2.5.2               # Audio playback
+edge-tts>=6.1.9,<8          # Microsoft Edge TTS (Indonesian voice)
+pygame>=2.5.2,<3            # Audio playback
 
 # ── Web Backend (dashboard mode) ─────────────────────────────
-fastapi>=0.111.0
-uvicorn[standard]>=0.29.0
-python-multipart>=0.0.9     # File upload support
-pydantic>=2.7.0
+fastapi>=0.111.0,<1
+uvicorn[standard]>=0.29.0,<1
+python-multipart>=0.0.9,<1  # File upload support
+pydantic>=2.7.0,<3
 
-# ── Utilities ─────────────────────────────────────────────────
-aiofiles>=23.2.1            # Async file I/O
+# ── Optional (nothing below is installed by this file) ────────
+# Only needed when PARKING_VEHICLE_MODEL points to an EXPORTED model; the
+# default best.pt needs none of it. Full procedure: SETUP.md, section
+# "Menjalankan di PC Lambat".
+#
+# ONNX Runtime (best.onnx — same detections as best.pt at the same imgsz):
+#   pip install onnxruntime onnx==1.18.0
+# Export with dynamic=True, otherwise PARKING_VEHICLE_IMGSZ is ignored for
+# the exported model. Not proven to start on a CPU without AVX2: benchmark it
+# on the target machine first (tools/benchmark_inference.py).
+#
+# OpenVINO (exported folder, e.g. best_openvino_model) — only for a CPU WITH
+# AVX2. Do not use it on an older CPU without AVX2 (e.g. Core i5-2400): it
+# falls back to SSE4.2 kernels and was not faster than best.pt in an
+# emulation capped to AVX (nothing was measured on such a CPU itself), and
+# 2nd-generation Core CPUs are not on OpenVINO's supported list.
+# openvino>=2024.0.0

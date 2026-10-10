@@ -54,26 +54,50 @@ function MetricCard({ title, value, icon, accentColor, softBg }) {
   )
 }
 
+// ─── Status processor (field "proc" dari WebSocket, boleh tidak ada) ──
+// Pesan error processor, atau null kalau processor normal
+function getProcError(proc) {
+  if (!proc || (proc.state !== 'error' && !proc.error)) return null
+  return proc.error || 'penyebab tidak diketahui'
+}
+
+// Lama proses tick terakhir: 2400 ms → "2,4 dtk/tick", 570 ms → "570 ms/tick"
+function formatTick(proc) {
+  const ms = proc?.tick_ms
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return null
+  if (ms < 1000) return `${Math.round(ms)} ms/tick`
+  const seconds = (ms / 1000).toLocaleString('id-ID', { minimumFractionDigits: 1, maximumFractionDigits: 1 })
+  return `${seconds} dtk/tick`
+}
+
 // ─── Connection badge ─────────────────────────────────────────
-function ConnectionBadge({ connected, error }) {
+// Tiga keadaan: Live (tersambung & processor jalan), Error (tersambung tapi
+// processor berhenti), Offline (WebSocket putus)
+function ConnectionBadge({ connected, error, procError }) {
+  const ok    = connected && !procError
+  const label = !connected ? 'Offline' : procError ? 'Error' : 'Live'
+  const title = !connected
+    ? (error || 'Mencoba reconnect...')
+    : procError ? `Processor berhenti: ${procError}` : 'Terhubung'
+
   return (
     <div
       className="flex items-center gap-2 px-3 py-1.5 rounded-full"
       style={{
-        background: connected ? 'rgba(34,211,238,0.06)' : 'rgba(248,113,113,0.06)',
-        border: `1px solid ${connected ? 'rgba(34,211,238,0.2)' : 'rgba(248,113,113,0.2)'}`,
+        background: ok ? 'rgba(34,211,238,0.06)' : 'rgba(248,113,113,0.06)',
+        border: `1px solid ${ok ? 'rgba(34,211,238,0.2)' : 'rgba(248,113,113,0.2)'}`,
       }}
-      title={!connected ? (error || 'Mencoba reconnect...') : 'Terhubung'}
+      title={title}
     >
       <span
-        className={`w-1.5 h-1.5 rounded-full shrink-0 ${connected ? 'live-dot' : 'animate-pulse'}`}
-        style={{ background: connected ? 'var(--cyan)' : 'var(--red)' }}
+        className={`w-1.5 h-1.5 rounded-full shrink-0 ${ok ? 'live-dot' : 'animate-pulse'}`}
+        style={{ background: ok ? 'var(--cyan)' : 'var(--red)' }}
       />
       <span
         className="font-mono text-[10px] tracking-widest uppercase"
-        style={{ color: connected ? 'var(--cyan)' : 'var(--red)' }}
+        style={{ color: ok ? 'var(--cyan)' : 'var(--red)' }}
       >
-        {connected ? 'Live' : 'Offline'}
+        {label}
       </span>
     </div>
   )
@@ -99,11 +123,12 @@ function ReconfigureBtn({ onClick }) {
 
 // ─── Main Dashboard ───────────────────────────────────────────
 function Dashboard({ onReconfigure }) {
-  const { alerts, stats, connected, error } = useAlerts()
+  const { alerts, stats, connected, error, proc } = useAlerts()
+  const procError = getProcError(proc)
 
   return (
     <div
-      className="h-screen flex flex-col bg-noise select-none"
+      className="h-screen flex flex-col select-none"
       style={{ background: 'var(--void)' }}
     >
       {/* ── Header ──────────────────────────────────────────── */}
@@ -134,7 +159,7 @@ function Dashboard({ onReconfigure }) {
 
         <div className="flex items-center gap-3">
           <ReconfigureBtn onClick={onReconfigure} />
-          <ConnectionBadge connected={connected} error={error} />
+          <ConnectionBadge connected={connected} error={error} procError={procError} />
           <LiveClock />
         </div>
       </header>
@@ -167,7 +192,11 @@ function Dashboard({ onReconfigure }) {
       {/* ── Main content ─────────────────────────────────────── */}
       <div className="flex flex-1 gap-3 px-5 pb-5 min-h-0">
         <div className="flex-[7] min-w-0">
-          <VideoMonitor />
+          <VideoMonitor
+            connected={connected}
+            procError={procError}
+            tickLabel={formatTick(proc)}
+          />
         </div>
         <div className="flex-[3] min-w-0">
           <AlertSidebar alerts={alerts} />

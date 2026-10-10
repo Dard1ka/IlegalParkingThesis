@@ -29,14 +29,18 @@ parking-dashboard/
 ├── postcss.config.js          # PostCSS + Tailwind
 ├── src/
 │   ├── main.jsx               # React root render
+│   ├── config.js              # Alamat backend: API_BASE, WS_URL, STREAM_URL
 │   ├── index.css              # Design system, animasi, CSS variables
 │   ├── App.jsx                # Root component — state machine (setup ↔ dashboard)
 │   ├── components/
 │   │   ├── SetupWizard.jsx    # Wizard konfigurasi 3 langkah
 │   │   ├── VideoMonitor.jsx   # Live video feed + ROI editor
 │   │   └── AlertSidebar.jsx   # Feed alert real-time
-│   └── hooks/
-│       └── useAlerts.js       # Custom hook WebSocket + auto-reconnect
+│   ├── hooks/
+│   │   ├── useAlerts.js       # Custom hook WebSocket + auto-reconnect
+│   │   └── useFirstFrame.js   # Custom hook: ambil frame pertama (GET /first_frame)
+│   └── lib/
+│       └── roiGeometry.js     # Geometri editor zona (klik → koordinat ternormalisasi)
 ```
 
 ---
@@ -95,7 +99,7 @@ Mengelola state `view` (`'setup'` | `'dashboard'`):
 Sub-komponen di dalam App.jsx:
 - **`LiveClock`** — Jam digital real-time (format Indonesia)
 - **`MetricCard`** — Kartu statistik (total kendaraan, warning, violation)
-- **`ConnectionBadge`** — Indikator status koneksi WebSocket (Live/Offline)
+- **`ConnectionBadge`** — Indikator status dengan tiga keadaan: **Live** (WebSocket tersambung dan processor berjalan), **Error** (tersambung, tetapi processor berhenti — penyebabnya muncul di tooltip), **Offline** (WebSocket putus)
 
 ### `SetupWizard.jsx` — Wizard Konfigurasi
 
@@ -139,13 +143,13 @@ Hook yang mengelola koneksi WebSocket ke backend:
 
 ```
 Connect → onopen → mulai ping setiap 25 detik
-                 → onmessage → parse JSON → update alerts & stats
+                 → onmessage → parse JSON → update alerts, stats & proc
                  → onclose → auto-reconnect setiap 3 detik
                  → onerror → set error message
 Unmount → close(1000) → tidak auto-reconnect
 ```
 
-Return value: `{ alerts, stats, connected, error }`
+Return value: `{ alerts, stats, connected, error, proc }` — `proc` adalah status processor dari backend (`state`, `tick`, `tick_ms`, `error`; lihat [`backend/README.md`](../backend/README.md#status-processor-proc)), atau `null` kalau backend tidak mengirimnya / koneksi putus.
 
 ---
 
@@ -178,7 +182,8 @@ Didefinisikan di `index.css` menggunakan CSS custom properties:
 
 - **DM Sans** — Body text
 - **Share Tech Mono** — Monospace (label, counter)
-- **Rajdhani** — Heading (tersedia, belum digunakan intensif)
+
+Kedua font diambil dari Google Fonts di `index.html` **tanpa menahan render**: stylesheet-nya dimuat sebagai `media="print"` lalu diaktifkan saat selesai (`onload`), dengan `<noscript>` sebagai cadangan. Dashboard langsung tampil dengan font fallback (`sans-serif` / `monospace`) dan berganti ke font di atas begitu tersedia — jadi internet yang lambat atau putus tidak menunda tampilan.
 
 ---
 
@@ -193,14 +198,18 @@ npm run dev
 # Buka http://localhost:5173
 ```
 
-> Backend harus sudah berjalan di `http://localhost:8000`.
+> Backend harus sudah berjalan di port 8000 pada host yang sama (alamat lain: lihat [Koneksi ke Backend](#koneksi-ke-backend)).
 
 ### Production Build
 
 ```bash
 npm run build
-npm run preview     # Preview build result
+npm run preview     # Preview build result (http://localhost:4173)
 ```
+
+> Origin `npm run preview` (port 4173) sudah termasuk default `PARKING_CORS_ORIGINS` di backend, jadi wizard tetap bisa memanggil API.
+>
+> Untuk pemakaian biasa di PC lambat, sajikan hasil build ini alih-alih `npm run dev` — lihat [`SETUP.md` → Menjalankan di PC Lambat](../SETUP.md#7-menjalankan-di-pc-lambat-cpu-lama-tanpa-avx2).
 
 ### Dengan Docker
 
@@ -214,13 +223,47 @@ docker compose up --build frontend
 
 ## Koneksi ke Backend
 
-Semua URL backend di-hardcode ke `localhost:8000` (v1.0):
+Alamat backend ditentukan di satu tempat, `src/config.js`. File lain tidak menulis alamat backend sendiri — semuanya mengimpor dari modul ini.
 
-| File | Konstanta | URL |
+| Export | Nilai | Dipakai untuk |
 |---|---|---|
-| `VideoMonitor.jsx` | `STREAM_URL` | `http://localhost:8000/video_feed` |
-| `VideoMonitor.jsx` | `API` | `http://localhost:8000` |
-| `SetupWizard.jsx` | `API` | `http://localhost:8000` |
-| `useAlerts.js` | `WS_URL` | `ws://localhost:8000/ws/alerts` |
+| `API_BASE` | `VITE_API_BASE`; kalau kosong: `http://<hostname halaman>:8000` | REST (`/upload`, `/configure`, `/first_frame`, `/set_roi`) |
+| `WS_URL` | `API_BASE` dengan `http` → `ws`, ditambah `/ws/alerts` | WebSocket alert |
+| `STREAM_URL` | `API_BASE` + `/video_feed` | MJPEG stream |
 
-> Di versi mendatang, ini akan di-extract ke environment variable via Vite (`import.meta.env`).
+Default-nya mengikuti hostname halaman dashboard:
+
+- dibuka di mesin backend (`http://localhost:5173`) → backend `http://localhost:8000`;
+- dibuka dari perangkat lain (mis. `http://192.168.1.20:5173`) → backend `http://192.168.1.20:8000`, tanpa build ulang.
+
+### Mengganti alamat backend (`VITE_API_BASE`)
+
+Hanya diperlukan kalau backend **tidak** berada di `<hostname yang sama>:8000` (port lain atau mesin lain). Variabel ini dibaca Vite saat `npm run dev` dan di-bake ke bundle saat `npm run build`.
+
+Windows — Command Prompt (cmd):
+
+```bat
+set VITE_API_BASE=http://192.168.1.20:8000
+npm run dev
+```
+
+Windows — PowerShell:
+
+```powershell
+$env:VITE_API_BASE = "http://192.168.1.20:8000"
+npm run dev
+```
+
+Linux / macOS:
+
+```bash
+VITE_API_BASE=http://192.168.1.20:8000 npm run dev
+```
+
+Alternatif yang menetap: tulis `VITE_API_BASE=http://192.168.1.20:8000` di file `parking-dashboard/.env` (dibaca Vite, tidak ikut git). Untuk Docker, nilainya diisi lewat `docker/.env` sebagai build-arg (lihat [`docker/README.md`](../docker/README.md)).
+
+### Membuka dashboard dari perangkat lain
+
+1. Jalankan Vite dengan `--host` supaya bisa diakses dari jaringan: `npm run dev -- --host`
+2. Tambahkan origin dashboard (mis. `http://192.168.1.20:5173`) ke `PARKING_CORS_ORIGINS` di backend — lihat tabel environment variable di [`backend/README.md`](../backend/README.md#environment-variables).
+3. Backend harus dijalankan dengan `--host 0.0.0.0` (sudah demikian di perintah pada dokumentasi).

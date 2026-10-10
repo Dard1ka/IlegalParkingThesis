@@ -6,10 +6,25 @@
     <title>Smart Parking Command Center</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <!--
+      Font dimuat TANPA menahan render: stylesheet diminta sebagai media="print"
+      (tidak memblokir first paint), lalu diaktifkan untuk layar begitu selesai
+      dimuat. Dashboard langsung tampil dengan font fallback dan berganti
+      (display=swap) saat font tiba — penting kalau internet lambat / putus.
+      <noscript> = cara biasa untuk browser tanpa JavaScript.
+    -->
     <link
-      href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@400;500;600;700&family=Share+Tech+Mono&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600&display=swap"
       rel="stylesheet"
+      media="print"
+      onload="this.media='all'"
     />
+    <noscript>
+      <link
+        href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600&display=swap"
+        rel="stylesheet"
+      />
+    </noscript>
   </head>
   <body>
     <div id="root"></div>

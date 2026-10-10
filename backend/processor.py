@@ -12,49 +12,112 @@ Perubahan utama vs demo3_tts.py:
   4. Setelah setiap tick, daftar alert ditulis ke SharedState sehingga
      WebSocket bisa meneruskannya ke frontend secara real-time.
   5. Video di-loop otomatis ketika mencapai akhir.
+  6. Model dimuat sekali per proses. Pergantian sumber ditangani loop
+     pengawas (bukan rekursi), dan kegagalan sumber tidak mematikan
+     thread: statusnya dilaporkan lewat SharedState ("proc").
 """
 
 from __future__ import annotations
+from collections import OrderedDict
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional
-import math, time, asyncio, threading, uuid, os
+import math, time, asyncio, threading, os, hashlib, re, textwrap, traceback
 
 import cv2
 import numpy as np
 from ultralytics import YOLO
-import pygame
-import edge_tts
 
 from .shared import SharedState
 
-# -- Koreksi orientasi kamera (video kebalik) --
-ROTATE_180 = True
-def _read_rot(cap):
-    ok, frame = cap.read()
-    if ok and ROTATE_180:
-        frame = cv2.rotate(frame, cv2.ROTATE_180)
-    return ok, frame
-
 
 # ══════════════════════════════════════════════════════════════
-# CONFIG  (sama persis dengan demo3_tts.py)
+# CONFIG  (logika & ambang sama persis dengan demo3_tts.py)
+#
+# Nilai bertanda [ENV] bisa diatur lewat environment variable. Dibaca
+# sekali saat import; nilai tidak valid → default + satu baris peringatan.
 # ══════════════════════════════════════════════════════════════
-VIDEO_PATH          = "input4.mp4"
-VEHICLE_MODEL_PATH  = "best.pt"
-TRIANGLE_MODEL_PATH = "triangle.pt"
+BACKEND_DIR = Path(__file__).resolve().parent
+
+
+def _env_int(name: str, default: int) -> int:
+    """Bilangan bulat >= 1 dari environment."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        print(f"[CONFIG] {name}={raw!r} tidak valid (harus bilangan bulat >= 1), pakai default {default}.")
+        return default
+    return value
+
+
+def _env_imgsz(name: str, default: int) -> int:
+    """Ukuran input YOLO, dibulatkan ke atas ke kelipatan 32 (stride model)."""
+    value   = _env_int(name, default)
+    rounded = ((value + 31) // 32) * 32
+    if rounded != value:
+        print(f"[CONFIG] {name}={value} dibulatkan ke atas menjadi {rounded} (harus kelipatan 32).")
+    return rounded
+
+
+def _env_model(name: str, default: str) -> str:
+    """
+    Path model: file .pt, atau hasil export-nya — file .onnx (dijalankan
+    ONNX Runtime) atau folder (mis. best_openvino_model).
+    """
+    raw = os.environ.get(name, "").strip()
+    if raw and not Path(raw).exists():
+        print(f"[CONFIG] {name}={raw!r} tidak ditemukan, pakai default {default!r}.")
+        return default
+    return raw or default
+
+
+def _env_tracker() -> str:
+    """
+    Konfigurasi tracker untuk model.track(). Default "botsort.yaml" bawaan
+    Ultralytics (BoT-SORT dengan GMC), sama seperti kode semula. Pilihan lain:
+      • "bytetrack.yaml" — bawaan Ultralytics;
+      • "botsort_static.yaml" — file bawaan backend (BoT-SORT tanpa GMC).
+        Opt-in: lebih ringan, tetapi hasil tracking bisa berbeda (lihat
+        komentar di file itu). Nama ini selalu mengarah ke
+        backend/botsort_static.yaml, dari folder mana pun backend dijalankan;
+      • path ke file YAML sendiri (.yaml / .yml).
+    """
+    default = "botsort.yaml"
+    raw = os.environ.get("PARKING_TRACKER", "").strip()
+    if not raw or raw in (default, "bytetrack.yaml"):
+        return raw or default
+    path = BACKEND_DIR / raw if raw == "botsort_static.yaml" else Path(raw)
+    if path.suffix.lower() in (".yaml", ".yml") and path.is_file():
+        return str(path.resolve())      # absolut: tidak bergantung pada folder kerja
+    print(f"[CONFIG] PARKING_TRACKER={raw!r} tidak ditemukan atau bukan file YAML, "
+          f"pakai default {default!r}.")
+    return default
+
+
+VEHICLE_MODEL_PATH  = _env_model("PARKING_VEHICLE_MODEL",  "best.pt")      # [ENV]
+TRIANGLE_MODEL_PATH = _env_model("PARKING_TRIANGLE_MODEL", "triangle.pt")  # [ENV]
 
 PARKING_CHECK_SECONDS   = 60
 ILLEGAL_PARKING_SECONDS = 300
 
-VEHICLE_IMGSZ        = 320
-TRIANGLE_IMGSZ       = 320
+VEHICLE_IMGSZ        = _env_imgsz("PARKING_VEHICLE_IMGSZ",  960)           # [ENV]
+TRIANGLE_IMGSZ       = _env_imgsz("PARKING_TRIANGLE_IMGSZ", 640)           # [ENV]
 VEHICLE_CONF         = 0.25
 TRIANGLE_CONF        = 0.20
 IOU                  = 0.50
 EXPAND_MARGIN        = 0.18
 ONLY_VEHICLE_CLASSES = ["car", "bus", "truck", "motorcycle"]
-TRACKER_CONFIG       = "botsort.yaml"
+TRACKER_CONFIG       = _env_tracker()                                      # [ENV] PARKING_TRACKER
+
+# [ENV] KHUSUS FILE VIDEO: jumlah detik video yang dilewati per tick.
+# 1 = perilaku asli (satu frame dianalisis per detik video). Nilai lebih besar
+# meringankan CPU dengan mengorbankan ketelitian waktu. Kamera tidak terpengaruh.
+TICK_STEP            = _env_int("PARKING_TICK_STEP", 1)
 
 OCCLUSION_TTL_SECONDS              = 80
 RELINK_MAX_DISTANCE                = 350
@@ -74,13 +137,49 @@ COLOR_CROP_TRIM_LEFT   = 0.08
 COLOR_CROP_TRIM_RIGHT  = 0.08
 HEURISTIC_SAMPLE_SIZE  = 96
 
-ENABLE_TTS      = os.environ.get("ENABLE_TTS", "true").lower() not in ("false", "0", "no")
+# strip(): "set ENABLE_TTS=false && uvicorn ..." di cmd menyimpan "false " (dengan spasi)
+ENABLE_TTS      = os.environ.get("ENABLE_TTS", "true").strip().lower() not in ("false", "0", "no")
 TTS_REPEAT_GAP  = 20
 EDGE_TTS_VOICE  = "id-ID-GadisNeural"
 EDGE_TTS_RATE   = "+0%"
 EDGE_TTS_VOLUME = "+0%"
 EDGE_TTS_PITCH  = "+0Hz"
 TTS_TEMP_DIR    = "outputs/tts_temp"
+TTS_QUEUE_SIZE  = 3        # pesan yang boleh antre (di luar yang sedang diputar)
+TTS_CACHE_MAX   = 64       # file audio (satu per kalimat) yang disimpan di TTS_TEMP_DIR, juga
+                           # antar restart (jenis x warna = maks 52 kalimat)
+TTS_BACKOFF_MIN = 30.0     # detik jeda setelah sintesis / pemutaran gagal ...
+TTS_BACKOFF_MAX = 300.0    # ... digandakan tiap gagal lagi, sampai batas ini
+TTS_CLOSE_WAIT  = 2.0      # detik menunggu thread TTS selesai saat processor berhenti
+TTS_BYTE_RATE   = 6000     # byte per detik audio: edge-tts selalu mengirim MP3 48 kbit/s CBR
+TTS_END_SLACK   = 1.0      # detik: audio utuh boleh lebih pendek segini dari akhir ucapan menurut
+                           # metadata edge-tts (terukur 0,03-0,05); lebih pendek lagi = terpotong
+
+# ── Penjadwalan loop (bukan logika deteksi) ───────────────────
+SOURCE_POLL_SECONDS    = 0.2    # jeda cek /configure saat belum ada sumber
+ROI_POLL_SECONDS       = 0.12   # jeda cek /set_roi saat menunggu zona
+GRAB_MAX_SKIP          = 60     # lompatan frame di atas ini pakai seek, bukan grab() berurutan
+                                # (terukur: 60 grab ≈ biaya satu seek; di atas itu seek lebih murah)
+GRAB_TIME_TOLERANCE    = 0.45   # satuan frame: selisih terbesar yang diterima antara nomor frame hasil
+                                # hitungan grab() dan nomor menurut stempel waktunya; lebih dari ini →
+                                # sumber itu kembali memakai seek (lihat _read_video_frame).
+                                # Seek OpenCV membulatkan stempel waktu ke nomor frame terdekat, jadi
+                                # hasilnya baru berbeda dari hitungan mulai selisih 0,5 (terukur pada
+                                # klip VFR: paling kecil 0,504). File CFR terukur ≤ 0,04; MKV yang
+                                # videonya mulai ~21-23 ms setelah audio punya selisih tetap 0,2-0,5.
+CAMERA_READ_RETRIES    = 5      # baca ulang sebelum perangkat kamera dibuka ulang
+CAMERA_REOPEN_ATTEMPTS = 3      # buka ulang perangkat sebelum menyerah
+CAMERA_RETRY_WAIT      = 0.5    # detik antar percobaan (hanya saat kamera gagal dibuka / dibaca)
+
+
+def print_effective_config() -> None:
+    """Cetak konfigurasi efektif sekali saat startup (dipanggil main.py sebelum thread processor
+    dimulai, supaya barisnya tidak bercampur dengan keluaran thread lain)."""
+    print(f"[CONFIG] Model kendaraan : {VEHICLE_MODEL_PATH} (imgsz {VEHICLE_IMGSZ})")
+    print(f"[CONFIG] Model segitiga  : {TRIANGLE_MODEL_PATH} (imgsz {TRIANGLE_IMGSZ})")
+    print(f"[CONFIG] Tracker         : {TRACKER_CONFIG}")
+    print(f"[CONFIG] Tick step       : {TICK_STEP} detik video per tick (khusus file video)")
+    print(f"[CONFIG] TTS             : {'aktif' if ENABLE_TTS else 'nonaktif'}")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -240,14 +339,11 @@ def classify_vehicle_color_hsv(bgr_crop, sample_size=96):
 
 @dataclass
 class ParkedRecord:
-    logical_id:   int
     tracker_id:   Optional[int]
     cls_name:     str
     bbox:         Tuple[int, int, int, int]
     center:       Tuple[float, float]
     roi_idx:      int
-    first_seen_time: int
-    last_seen_time:  int
     hidden_since:    Optional[int]  = None
     stationary_since: Optional[int] = None
     parked_since:    Optional[int]  = None
@@ -255,90 +351,285 @@ class ParkedRecord:
     reappeared_at:   Optional[int]  = None
     triangle_checked: bool = False
     triangle_found:   bool = False
-    illegal_reported: bool = False
+    illegal_seen:     bool = False   # sudah pernah terlihat berstatus ILEGAL sejak mulai parkir
+                                     # (hanya dipakai skor relink, lihat get_best_hidden_match)
     last_alert_time:  int  = -9999
     color_name:       str  = "unknown"
-    color_pct:        float = 0.0
     prev_logic_center: Optional[Tuple[float, float]] = None
     parked_bbox:       Optional[Tuple[int, int, int, int]] = None
     parked_center:     Optional[Tuple[float, float]] = None
 
 
 # ══════════════════════════════════════════════════════════════
-# TTS  (sama persis dengan demo3_tts.py)
+# TTS  — satu thread pekerja + antrean kecil + cache audio per kalimat
 # ══════════════════════════════════════════════════════════════
 
-tts_busy = False
-tts_lock = threading.Lock()
-
-if ENABLE_TTS:
-    Path(TTS_TEMP_DIR).mkdir(parents=True, exist_ok=True)
+def _remove_file(path) -> None:
     try:
-        pygame.mixer.init()
-    except Exception as e:
-        print(f"[TTS] pygame init gagal: {e}")
+        os.remove(path)
+    except OSError:
+        pass
 
-async def _edge_tts_save(text: str, out_mp3: str):
-    c = edge_tts.Communicate(text=text, voice=EDGE_TTS_VOICE,
-                              rate=EDGE_TTS_RATE, volume=EDGE_TTS_VOLUME, pitch=EDGE_TTS_PITCH)
-    await c.save(out_mp3)
 
-def _speak_worker(message: str):
-    global tts_busy
-    tmp = os.path.join(TTS_TEMP_DIR, f"tts_{uuid.uuid4().hex}.mp3")
-    try:
-        print(f"[TTS] Generating audio → {tmp}")
+TTS_FILE_RE = re.compile(r"tts_[0-9a-f]{16}\.mp3")     # nama file buatan _tts_audio_path()
 
-        # FIX: asyncio.run() di daemon thread saat FastAPI event loop running
-        # bisa konflik. Gunakan new event loop eksplisit per-thread.
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+
+def _tts_audio_path(message: str) -> str:
+    """
+    Path MP3 untuk sebuah kalimat. Nama file = hash kalimat + pengaturan suara,
+    jadi selalu sama di setiap proses: audio yang sudah jadi bisa dipakai lagi
+    setelah restart, dan tidak terpakai lagi bila pengaturan suara diubah.
+    """
+    key = "|".join((message, EDGE_TTS_VOICE, EDGE_TTS_RATE, EDGE_TTS_VOLUME, EDGE_TTS_PITCH))
+    return os.path.join(TTS_TEMP_DIR, f"tts_{hashlib.sha1(key.encode('utf-8')).hexdigest()[:16]}.mp3")
+
+
+class TTSSpeaker:
+    """
+    Menyuarakan peringatan lewat SATU thread pekerja berumur panjang.
+
+      • Antrean kecil (TTS_QUEUE_SIZE) dan paling banyak satu pesan per
+        logical id, supaya suara tidak tertinggal jauh dari video.
+      • submit() mengembalikan True hanya bila pesan diterima untuk
+        disuarakan; baru saat itu pemanggil memajukan last_alert_time.
+      • Audio disimpan per kalimat di TTS_TEMP_DIR dan tetap dipakai setelah
+        backend di-restart, jadi kalimat yang sama tidak disintesis ulang
+        lewat jaringan. Isi folder dibatasi TTS_CACHE_MAX file; yang paling
+        lama tidak dipakai dibuang lebih dulu. Unduhan yang terpotong tidak
+        pernah disimpan, dan file yang tidak bisa dimuat dibuang.
+      • Jaringan / perangkat audio gagal → jeda (backoff) + satu baris
+        peringatan, tanpa traceback. Pesan yang masih antre dan pasti gagal
+        ikut dibuang, jadi satu gangguan tidak melipatgandakan jedanya.
+      • Thread baru dibuat saat submit() pertama; pygame dan edge_tts baru
+        di-import di thread itu (lazy), jadi tidak dimuat bila tidak ada alert.
+      • close() (processor berhenti) menghentikan suara dan mengakhiri thread.
+
+    Hanya dibuat bila ENABLE_TTS aktif.
+    """
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._queue: List[Tuple[int, str]] = []                # (logical_id, kalimat)
+        self._speaking: Optional[int] = None                   # logical id yang sedang disuarakan
+        self._abort       = False                              # minta suara yang berjalan dihentikan
+        self._closed      = False                              # close() sudah dipanggil
+        self._cache: OrderedDict[str, None] = OrderedDict()    # path MP3 yang sudah jadi; yang paling
+                                                               # lama tidak dipakai ada di depan
+        self._backoff     = 0.0                                # lama jeda saat ini (detik)
+        self._retry_after = 0.0                                # time.monotonic() akhir jeda
+        self._audio_down  = False                              # yang gagal perangkat audio, bukan jaringan
+        self._thread: Optional[threading.Thread] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None # event loop milik thread pekerja
+
+        # Audio yang sudah jadi dari proses sebelumnya dipakai lagi (urut dari yang
+        # paling lama). Yang dibuang hanya sisa yang bukan audio jadi (unduhan
+        # terpotong .part, file sementara versi lama), file kosong, dan
+        # kelebihan di atas TTS_CACHE_MAX.
         try:
-            loop.run_until_complete(_edge_tts_save(message, tmp))
-        finally:
-            loop.close()
+            Path(TTS_TEMP_DIR).mkdir(parents=True, exist_ok=True)
+            finished = []
+            for leftover in Path(TTS_TEMP_DIR).glob("tts_*"):
+                info = leftover.stat()
+                if TTS_FILE_RE.fullmatch(leftover.name) and info.st_size > 0:
+                    finished.append((info.st_mtime, leftover.name))
+                else:
+                    _remove_file(leftover)
+            for _, name in sorted(finished):
+                self._remember(os.path.join(TTS_TEMP_DIR, name))
+        except OSError as e:
+            print(f"[TTS] Folder {TTS_TEMP_DIR} tidak bisa disiapkan: {e}")
 
-        if not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
-            print(f"[TTS ERROR] File kosong/tidak terbuat: {tmp}")
-            return
+    # ── Dipanggil dari thread processor ───────────────────────
+    def submit(self, logical_id: int, message: str) -> bool:
+        """True bila pesan diterima untuk disuarakan."""
+        with self._cv:
+            if self._closed:
+                return False
+            if logical_id == self._speaking or any(lid == logical_id for lid, _ in self._queue):
+                return False                                   # sudah antre / sedang disuarakan
+            if len(self._queue) >= TTS_QUEUE_SIZE:
+                return False                                   # penuh → dicoba lagi tick berikutnya
+            if self._on_hold(message):
+                return False                                   # baru saja gagal → tunggu jedanya habis
+            self._queue.append((logical_id, message))
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._run, daemon=True, name="TTSSpeaker")
+                self._thread.start()
+            self._cv.notify()
+            return True
 
-        # Pastikan pygame mixer init — retry kalau gagal
-        if not pygame.mixer.get_init():
+    def cancel(self, logical_id: int) -> None:
+        """Kendaraan sudah pergi: pesannya yang masih antre sudah basi."""
+        with self._cv:
+            self._queue = [item for item in self._queue if item[0] != logical_id]
+
+    def clear(self) -> None:
+        """Sumber / zona berganti atau video diulang: logical id mulai dari 1 lagi."""
+        with self._cv:
+            self._queue.clear()
+            self._abort = True
+
+    def close(self) -> None:
+        """Processor berhenti: hentikan suara yang berjalan dan akhiri thread pekerja."""
+        with self._cv:
+            self._closed = True
+            self._queue.clear()
+            self._abort = True
+            self._cv.notify()
+            thread = self._thread
+        if thread is not None:
+            thread.join(TTS_CLOSE_WAIT)     # sintesis lewat jaringan tidak bisa dipotong → tidak ditunggu lama
+
+    def _on_hold(self, message: str) -> bool:
+        """
+        (self._cv harus terkunci) Jeda setelah kegagalan masih berjalan DAN
+        kalimat ini pasti gagal lagi: perangkat audio bermasalah, atau audionya
+        belum ada di cache sehingga perlu jaringan.
+        """
+        return (time.monotonic() < self._retry_after
+                and (self._audio_down or _tts_audio_path(message) not in self._cache))
+
+    def _remember(self, path: str) -> None:
+        """
+        Catat `path` sebagai audio yang baru saja dipakai, lalu hapus file yang
+        paling lama tidak dipakai bila jumlahnya melebihi TTS_CACHE_MAX.
+        """
+        with self._cv:
+            self._cache[path] = None
+            self._cache.move_to_end(path)
+            evicted = [self._cache.popitem(last=False)[0]
+                       for _ in range(len(self._cache) - TTS_CACHE_MAX)]
+        for old in evicted:
+            _remove_file(old)
+
+    def _forget(self, path: str) -> None:
+        """File audio tidak bisa dimuat (rusak): buang, supaya kalimatnya disintesis ulang."""
+        with self._cv:
+            self._cache.pop(path, None)
+        _remove_file(path)
+
+    # ── Thread pekerja ────────────────────────────────────────
+    def _run(self):
+        # asyncio.run() di thread ini bisa konflik dengan event loop FastAPI,
+        # jadi pakai event loop sendiri — satu untuk seumur thread.
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        while True:
+            with self._cv:
+                while not self._queue and not self._closed:
+                    self._cv.wait()
+                if self._closed:
+                    break
+                logical_id, message = self._queue.pop(0)
+                self._speaking, self._abort = logical_id, False
+            audio_stage = False
             try:
-                pygame.mixer.init()
+                path, from_network = self._audio_for(message)
+                audio_stage = True
+                self._play(path)
+                with self._cv:
+                    # Jeda dicabut hanya bila penyebabnya terbukti sudah pulih: audio
+                    # dari cache yang berhasil diputar belum membuktikan jaringan normal.
+                    if from_network or self._audio_down:
+                        self._backoff, self._retry_after = 0.0, 0.0
+                    self._audio_down = False
             except Exception as e:
-                print(f"[TTS ERROR] pygame.mixer.init() gagal: {e}")
-                return
+                self._note_failure(e, audio_stage)
+            finally:
+                with self._cv:
+                    self._speaking = None
+        self._loop.close()      # close(): thread selesai, event loop-nya ikut dilepas
 
-        pygame.mixer.music.load(tmp)
-        pygame.mixer.music.play()
-        print(f"[TTS] ▶ Playing: {message[:60]}...")
+    def _audio_for(self, message: str) -> Tuple[str, bool]:
+        """
+        (path MP3, baru_disintesis) untuk kalimat ini: file yang sudah jadi
+        dipakai lagi (termasuk peninggalan proses sebelumnya), selain itu
+        disintesis sekali lewat jaringan lalu disimpan.
+        """
+        path = _tts_audio_path(message)
+        if os.path.exists(path):
+            self._remember(path)
+            return path, False
 
-        while pygame.mixer.music.get_busy():
-            time.sleep(0.1)
-
-        print(f"[TTS] ✓ Selesai.")
-
-    except Exception as e:
-        import traceback
-        print(f"[TTS ERROR] {type(e).__name__}: {e}")
-        traceback.print_exc()
-    finally:
-        try: pygame.mixer.music.unload()
-        except: pass
+        import edge_tts                                        # lazy import
+        part = path + ".part"
+        communicate = edge_tts.Communicate(text=message, voice=EDGE_TTS_VOICE, rate=EDGE_TTS_RATE,
+                                           volume=EDGE_TTS_VOLUME, pitch=EDGE_TTS_PITCH)
         try:
-            if os.path.exists(tmp): os.remove(tmp)
-        except: pass
-        with tts_lock:
-            tts_busy = False
+            speech_end = self._loop.run_until_complete(self._download(communicate, part))
+            seconds    = os.path.getsize(part) / TTS_BYTE_RATE
+            if seconds == 0:
+                raise RuntimeError("audio kosong")
+            # Koneksi yang putus di tengah unduhan TIDAK dilaporkan edge-tts sebagai
+            # error: stream berakhir biasa dengan audio sebagian. Dikenali dari
+            # metadatanya: belum sampai (terukur kadang baru dikirim setelah 43-66%
+            # audio), atau audionya lebih pendek daripada akhir ucapan.
+            if speech_end is None or seconds < speech_end - TTS_END_SLACK:
+                raise RuntimeError(f"audio terpotong (baru {seconds:.1f} detik)")
+            with open(part, "rb+") as f:
+                os.fsync(f.fileno())      # isinya sudah di disk sebelum dijadikan cache yang awet:
+                                          # listrik padam tidak meninggalkan file audio rusak
+            os.replace(part, path)        # atomik: file .part tidak pernah terbaca sebagai cache
+        finally:
+            _remove_file(part)
 
-def speak_once(message: str):
-    global tts_busy
-    if not ENABLE_TTS: return
-    with tts_lock:
-        if tts_busy: return
-        tts_busy = True
-    threading.Thread(target=_speak_worker, args=(message,), daemon=True).start()
+        self._remember(path)
+        return path, True
+
+    @staticmethod
+    async def _download(communicate, part: str) -> Optional[float]:
+        """
+        Tulis audio dari edge-tts ke `part`. Return detik akhir ucapan menurut
+        metadata (WordBoundary / SentenceBoundary) yang ikut dikirim, atau None
+        bila tidak ada metadata yang sampai.
+        """
+        speech_end = None
+        with open(part, "wb") as f:
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    f.write(chunk["data"])
+                elif "offset" in chunk and "duration" in chunk:    # satuan 100 nanodetik
+                    speech_end = max(speech_end or 0.0, (chunk["offset"] + chunk["duration"]) / 1e7)
+        return speech_end
+
+    def _play(self, path: str) -> None:
+        import pygame                                          # lazy import
+        if not pygame.mixer.get_init():
+            pygame.mixer.init()
+        music = pygame.mixer.music
+        loaded = False
+        try:
+            music.load(path)
+            loaded = True
+            if not self._abort:
+                music.play()
+            while music.get_busy():
+                if self._abort:                                # clear(): hentikan suara sumber lama
+                    music.stop()
+                    break
+                time.sleep(0.1)
+        finally:
+            try:
+                music.unload()                                 # lepas kunci file (Windows)
+            except Exception:
+                pass
+            if not loaded:
+                self._forget(path)                             # file rusak jangan tinggal di cache
+
+    def _note_failure(self, exc: Exception, audio_stage: bool) -> None:
+        """Offline / perangkat audio bermasalah: satu baris peringatan + jeda, tanpa traceback."""
+        with self._cv:
+            self._backoff     = min(TTS_BACKOFF_MAX, max(TTS_BACKOFF_MIN, self._backoff * 2))
+            self._retry_after = time.monotonic() + self._backoff
+            self._audio_down  = audio_stage
+            # Pesan yang sudah antre dan pasti gagal ikut dibuang: satu gangguan =
+            # satu baris peringatan + satu jeda, bukan jeda yang berlipat per pesan.
+            # Loop tick mengajukannya lagi setelah TTS_REPEAT_GAP.
+            self._queue = [item for item in self._queue if not self._on_hold(item[1])]
+            wait = self._backoff
+        what   = "Pemutaran audio" if audio_stage else "Sintesis suara"
+        reason = " ".join(str(exc).split())[:120]
+        print(f"[TTS] {what} gagal ({type(exc).__name__}: {reason}), coba lagi dalam {wait:.0f} detik.")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -376,7 +667,7 @@ def get_required_moving_reset_seconds(rec: ParkedRecord, logic_second: int) -> i
     if d >= PARKING_CHECK_SECONDS:   return 10
     return MOVING_RESET_SECONDS
 
-def make_warning_text(rec: ParkedRecord, frame_w: int) -> str:
+def make_warning_text(rec: ParkedRecord) -> str:
     return (
         f"Mohon untuk {bahasa_label(rec.cls_name)} dengan warna {warna_label(rec.color_name)} "
         f"untuk tidak parkir di situ atau akan terkena denda karena bukan tempat parkir."
@@ -384,21 +675,16 @@ def make_warning_text(rec: ParkedRecord, frame_w: int) -> str:
 
 
 # ══════════════════════════════════════════════════════════════
-# RELINKING FUNCTIONS  (sama persis dengan demo3_tts.py)
+# RELINKING FUNCTIONS  (sama persis dengan demo3_tts.py, kecuali suku
+# warna pada skor. Di sana warna deteksi selalu "unknown", jadi suku
+# itu tidak pernah mencocokkan warna: efek nyatanya hanya penalti -100
+# untuk record yang warnanya sudah terisi, dan warna baru diisi saat
+# kendaraan terlihat berstatus ILEGAL. Efek itu dipertahankan lewat
+# rec.illegal_seen, supaya hasil relink tidak berubah)
 # ══════════════════════════════════════════════════════════════
 
-def recover_roi_from_nearby_hidden_record(center, cls_name, parked_records, logic_second):
-    best_roi, best_dist = None, 1e9
-    for _, rec in parked_records.items():
-        if rec.cls_name != cls_name or rec.hidden_since is None: continue
-        if logic_second - rec.hidden_since > OCCLUSION_TTL_SECONDS: continue
-        d = euclidean(center, rec.center)
-        if d < RELINK_MAX_DISTANCE and d < best_dist:
-            best_dist, best_roi = d, rec.roi_idx
-    return best_roi
-
 def get_best_hidden_match(det_bbox, det_center, det_cls_name, det_roi_idx,
-                          det_color, parked_records, logic_second, used_hidden_ids):
+                          parked_records, logic_second, used_hidden_ids):
     det_foot = foot_point(det_bbox)
 
     def _eval(rec):
@@ -406,8 +692,7 @@ def get_best_hidden_match(det_bbox, det_center, det_cls_name, det_roi_idx,
             ref_bbox, ref_center = rec.parked_bbox, rec.parked_center or rec.center
         else:
             ref_bbox, ref_center = rec.bbox, rec.center
-        return (ref_bbox, ref_center,
-                euclidean(det_center, ref_center),
+        return (euclidean(det_center, ref_center),
                 euclidean(det_foot, foot_point(ref_bbox)),
                 bbox_iou(det_bbox, ref_bbox))
 
@@ -426,8 +711,8 @@ def get_best_hidden_match(det_bbox, det_center, det_cls_name, det_roi_idx,
               450 if d >= PARKING_CHECK_SECONDS else
               300 if rec.parked_since else 0)
         s += d * 8.0
-        if rec.color_name != "unknown":
-            s += 200 if rec.color_name == det_color else -100
+        if rec.illegal_seen and rec.color_name != "unknown":     # "warnanya sudah terisi"
+            s -= 100
         return s
 
     # Pass 1: hanya record yang sudah parked
@@ -438,7 +723,7 @@ def get_best_hidden_match(det_bbox, det_center, det_cls_name, det_roi_idx,
         if rec.cls_name != det_cls_name: continue
         if det_roi_idx is not None and rec.roi_idx != det_roi_idx: continue
         if rec.parked_since is None: continue
-        _, _, cd, fd, iou = _eval(rec)
+        cd, fd, iou = _eval(rec)
         if not _ok(rec, cd, fd, iou): continue
         s = _score(rec, cd, fd, iou)
         if s > best_s: best_s, best_id = s, lid
@@ -451,14 +736,14 @@ def get_best_hidden_match(det_bbox, det_center, det_cls_name, det_roi_idx,
         if rec.cls_name != det_cls_name: continue
         if det_roi_idx is not None and rec.roi_idx != det_roi_idx: continue
         if rec.parked_since is not None: continue
-        _, _, cd, fd, iou = _eval(rec)
+        cd, fd, iou = _eval(rec)
         if not _ok(rec, cd, fd, iou): continue
         s = _score(rec, cd, fd, iou)
         if s > best_s: best_s, best_id = s, lid
     return best_id
 
 def get_locked_hidden_parked_record(det_bbox, det_center, det_cls_name, det_roi_idx,
-                                    det_color, parked_records, logic_second):
+                                    parked_records, logic_second):
     det_foot = foot_point(det_bbox)
     best_id, best_s = None, 1e18
     for lid, rec in parked_records.items():
@@ -481,6 +766,18 @@ def get_locked_hidden_parked_record(det_bbox, det_center, det_cls_name, det_roi_
 # VIDEO PROCESSOR  (class utama)
 # ══════════════════════════════════════════════════════════════
 
+class SourceError(RuntimeError):
+    """Sumber tidak bisa dipakai (gagal dibuka / dibaca). Pesannya tampil di dashboard."""
+
+
+def _short_error(exc: BaseException) -> str:
+    """Pesan error satu baris untuk status "proc" dan frame placeholder."""
+    text = " ".join(str(exc).split())
+    if not isinstance(exc, SourceError):
+        text = f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+    return text[:240]
+
+
 class VideoProcessor:
     """
     Jalankan processor.run() di background thread.
@@ -496,6 +793,7 @@ class VideoProcessor:
     def __init__(self, shared: SharedState):
         self.shared  = shared
         self._stop   = threading.Event()
+        self._tts: Optional[TTSSpeaker] = None   # dibuat di run() bila ENABLE_TTS
 
     def stop(self):
         self._stop.set()
@@ -553,16 +851,148 @@ class VideoProcessor:
         if ok:
             self.shared.set_frame(buf.tobytes())
 
+    def _push_text_frame(self, title: str, lines: List[str],
+                         title_color=(60, 60, 80), text_color=(50, 50, 70)):
+        """Frame status tanpa video (menunggu sumber / processor berhenti)."""
+        blank = np.zeros((480, 854, 3), dtype=np.uint8)
+        cv2.putText(blank, title, (60, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.9, title_color, 2)
+        for i, line in enumerate(lines):
+            cv2.putText(blank, line, (60, 260 + 30 * i),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, text_color, 2)
+        self._push_frame(blank)
+
+    def _push_hint_frame(self, frame: np.ndarray, title: str, subtitle: str = ""):
+        """Frame diam dari sumber + teks petunjuk (menunggu zona / mulai deteksi)."""
+        overlay = frame.copy()      # frame aslinya masih dianalisis di tick pertama
+        mid = overlay.shape[0] // 2
+        cv2.putText(overlay, title, (30, mid - 20), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.85, (0, 210, 230), 2, cv2.LINE_AA)
+        if subtitle:
+            cv2.putText(overlay, subtitle, (30, mid + 20), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.65, (150, 150, 150), 2, cv2.LINE_AA)
+        self._push_frame(overlay)
+
+    # ── Kegagalan: dilaporkan, thread tetap hidup ──────────────
+    def _fail(self, message: str):
+        """
+        Status "error" + alert dikosongkan + frame placeholder berisi alasannya.
+        Setelah ini processor menunggu /configure berikutnya; sumber yang gagal
+        tidak dicoba ulang sendiri.
+        """
+        self.shared.set_proc_state("error", message)
+        self.shared.clear_alerts()
+        self._push_text_frame(
+            "Processor berhenti",
+            textwrap.wrap(message, 58)[:4] + ["Konfigurasi ulang sumber dari dashboard."],
+            title_color=(70, 70, 235), text_color=(190, 190, 190))
+        print(f"[PROC] Processor berhenti: {message}")
+
+    @staticmethod
+    def _describe_source(source: dict) -> str:
+        if source.get("type") == "camera":
+            return f"kamera index {source.get('index', 0)}"
+        return str(source.get("path"))
+
+    @staticmethod
+    def _reset_tracker(vehicle_model):
+        """
+        Kosongkan state BoT-SORT (track, ID, frame GMC) tanpa `predictor = None`:
+        cara itu membuat Ultralytics mendaftarkan callback tracker sekali lagi,
+        sehingga tracker.update() jalan dua kali per frame.
+        """
+        predictor = getattr(vehicle_model, "predictor", None)   # None sebelum .track() pertama
+        for tracker in getattr(predictor, "trackers", None) or []:
+            tracker.reset()
+
+    @staticmethod
+    def _tracker_ready(vehicle_model) -> bool:
+        """True bila .track() sudah pernah selesai menyiapkan tracker di objek model ini."""
+        return hasattr(getattr(vehicle_model, "predictor", None), "trackers")
+
     # ── Entry point ────────────────────────────────────────────
     def run(self):
         self.shared.set_running(True)
+        fatal = None
         try:
-            self._run_inner()
+            if ENABLE_TTS:
+                self._tts = TTSSpeaker()
+            self._run_supervisor()
         except Exception as e:
+            fatal = _short_error(e)
             print(f"[PROC] Error fatal: {e}")
+            traceback.print_exc()
         finally:
+            if self._tts is not None:
+                self._tts.close()
             self.shared.set_running(False)
+            self.shared.set_proc_state("stopped", fatal)
             print("[PROC] Processor berhenti.")
+
+    def _load_models(self):
+        """Muat kedua model YOLO. Return (vehicle_model, triangle_model), atau None bila gagal."""
+        self.shared.set_proc_state("loading_models")
+        print("[PROC] Memuat model YOLO...")
+        try:
+            # task="detect": model hasil export (mis. folder OpenVINO) tidak bisa
+            # ditebak task-nya dari nama file. Untuk .pt argumen ini tidak
+            # berpengaruh, task tetap dibaca dari checkpoint.
+            vehicle_model  = YOLO(VEHICLE_MODEL_PATH,  task="detect")
+            triangle_model = YOLO(TRIANGLE_MODEL_PATH, task="detect")
+        except Exception as e:
+            traceback.print_exc()
+            self._fail(f"Model YOLO gagal dimuat: {_short_error(e)}")
+            return None
+        print("[PROC] Model dimuat.")
+        return vehicle_model, triangle_model
+
+    def _run_supervisor(self):
+        """
+        Loop pengawas: model dimuat SEKALI per proses, lalu sumber diproses satu
+        per satu. Sumber baru atau sumber yang gagal mengembalikan kendali ke
+        loop ini (tanpa rekursi), jadi tidak ada kegagalan sumber yang mematikan
+        thread.
+        """
+        # 1. Load YOLO models
+        models = self._load_models()
+
+        # 2. Tampilkan layar tunggu sampai user konfigurasi sumber
+        if models is not None:
+            self.shared.set_proc_state("waiting_source")
+            self._push_text_frame("Menunggu konfigurasi sumber...",
+                                  ["Buka dashboard → pilih Video atau Kamera"])
+            print("[PROC] Menunggu konfigurasi sumber dari frontend...")
+
+        source = None
+        while not self._stop.is_set():
+            # Hanya sumber yang BARU dikirim /configure yang diambil (take_source),
+            # jadi sumber yang gagal tidak dibuka ulang terus-menerus.
+            if source is None:
+                source = self.shared.take_source()
+            if source is None:
+                self._stop.wait(SOURCE_POLL_SECONDS)
+                continue
+
+            current, source = source, None
+            if models is None:                  # model gagal dimuat sebelumnya → coba lagi
+                models = self._load_models()
+                if models is None:
+                    continue
+                self.shared.set_proc_state("opening_source")
+
+            try:
+                # 3. Proses sumber ini sampai ada sumber baru (dikembalikan) atau stop()
+                source = self._run_source(current, *models)
+            except Exception as e:
+                if not isinstance(e, SourceError):   # sumber gagal = kejadian biasa: cukup satu baris
+                    traceback.print_exc()
+                self._fail(_short_error(e))
+                # .track() pertama gagal sebelum tracker selesai disiapkan: callback
+                # tracker sudah terdaftar di objek model ini, dan Ultralytics akan
+                # mendaftarkannya SEKALI LAGI pada .track() berikutnya (tracker.update()
+                # jalan dua kali per frame). Buang objeknya supaya /configure berikutnya
+                # memuat model baru. Sumber yang gagal (SourceError) tidak menyentuh model.
+                if not isinstance(e, SourceError) and not self._tracker_ready(models[0]):
+                    models = None
 
     def _open_source(self, source: dict):
         """Buka video file atau kamera berdasarkan config."""
@@ -572,54 +1002,156 @@ class VideoProcessor:
             cap = cv2.VideoCapture(idx)
             print(f"[PROC] Membuka kamera index {idx}...")
         else:
-            path = source.get("path", VIDEO_PATH)
+            path = source["path"]
             cap = cv2.VideoCapture(path)
             print(f"[PROC] Membuka video: {path}...")
         return cap
 
-    def _run_inner(self):
-        # 1. Load YOLO models
-        print("[PROC] Memuat model YOLO...")
-        vehicle_model  = YOLO(VEHICLE_MODEL_PATH)
-        triangle_model = YOLO(TRIANGLE_MODEL_PATH)
-        print("[PROC] Model dimuat.")
-
-        # 2. Tampilkan layar tunggu sampai user konfigurasi sumber
-        print("[PROC] Menunggu konfigurasi sumber dari frontend...")
-        while not self._stop.is_set():
-            if self.shared.has_source():
-                break
-
-            blank = np.zeros((480, 854, 3), dtype=np.uint8)
-            cv2.putText(blank, "Menunggu konfigurasi sumber...",
-                        (60, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (60, 60, 80), 2)
-            cv2.putText(blank, "Buka dashboard → pilih Video atau Kamera",
-                        (60, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (50, 50, 70), 2)
-            self._push_frame(blank)
-            time.sleep(0.5)
-
-        if self._stop.is_set():
-            return
-
-        # 3. Buka sumber berdasarkan config
-        source = self.shared.get_source()
+    def _run_source(self, source: dict, vehicle_model, triangle_model) -> Optional[dict]:
+        """
+        Proses satu sumber. Return sumber baru bila ada /configure baru, None bila
+        stop(). Kegagalan dilempar sebagai exception ke loop pengawas; capture
+        selalu dilepas.
+        """
+        self._reset_tracker(vehicle_model)      # ID / track sumber sebelumnya tidak boleh terbawa
+        if self._tts is not None:
+            self._tts.clear()
         cap = self._open_source(source)
-        if not cap.isOpened():
-            print(f"[PROC] GAGAL membuka sumber: {source}")
-            return
+        try:
+            return self._run_inner(cap, source, vehicle_model, triangle_model)
+        finally:
+            cap.release()
 
-        fps          = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    def _retry_camera_open(self, cap, source: dict) -> bool:
+        """
+        Kamera tidak terbuka. Webcam USB (terutama di Windows) kadang menolak
+        dibuka lagi sesaat setelah dilepas, misalnya saat kamera yang sama
+        dikonfigurasi ulang. Coba buka lagi beberapa kali dengan jeda pendek
+        yang tetap menghormati stop(). Return False bila stop() atau ada sumber
+        baru; selain itu True (terbuka atau tidak, diperiksa pemanggil).
+        """
+        idx = int(source.get("index", 0))
+        for attempt in range(1, CAMERA_REOPEN_ATTEMPTS + 1):
+            if self._stop.wait(CAMERA_RETRY_WAIT) or self.shared.has_source_pending():
+                return False
+            print(f"[PROC] Kamera index {idx} belum terbuka, mencoba lagi "
+                  f"(percobaan {attempt}/{CAMERA_REOPEN_ATTEMPTS})...")
+            cap.open(idx)                       # parameter sama dengan cv2.VideoCapture(idx)
+            if cap.isOpened():
+                break
+        return True
+
+    def _recover_camera(self, cap, source: dict) -> Optional[np.ndarray]:
+        """
+        cap.read() kamera gagal: baca ulang beberapa kali, lalu buka ulang
+        perangkatnya beberapa kali, dengan jeda pendek yang tetap menghormati
+        stop(). Return frame bila pulih; None bila stop() atau ada sumber baru;
+        SourceError bila tetap gagal.
+        """
+        idx = int(source.get("index", 0))
+        print("[PROC] Kamera gagal baca frame, mencoba ulang...")
+        for attempt in range(CAMERA_REOPEN_ATTEMPTS + 1):
+            if attempt:
+                print(f"[PROC] Membuka ulang kamera index {idx} "
+                      f"(percobaan {attempt}/{CAMERA_REOPEN_ATTEMPTS})...")
+                cap.release()
+                cap.open(idx)                   # parameter sama dengan cv2.VideoCapture(idx)
+            for _ in range(CAMERA_READ_RETRIES):
+                if self._stop.wait(CAMERA_RETRY_WAIT) or self.shared.has_source_pending():
+                    return None
+                if cap.isOpened():
+                    ret, frame = cap.read()
+                    if ret:
+                        print("[PROC] Kamera pulih.")
+                        return frame
+        raise SourceError(f"Kamera index {idx} berhenti mengirim frame "
+                          f"(sudah {CAMERA_REOPEN_ATTEMPTS}x dibuka ulang)")
+
+    @staticmethod
+    def _grab_base(cap, fps: float) -> Optional[int]:
+        """
+        Dipanggil tepat setelah frame PERTAMA file video dibaca: nomor frame itu
+        menurut stempel waktunya, dibulatkan seperti OpenCV. Hampir selalu 0;
+        bisa 1-2 bila video mulai sedikit setelah audionya. Menjadi patokan
+        _read_video_frame; None = stempelnya terlalu dekat ke batas pembulatan,
+        jadi frame selalu diambil dengan cap.set().
+        """
+        stamp = cap.get(cv2.CAP_PROP_POS_MSEC) * fps / 1000.0
+        base  = int(stamp + 0.5) if math.isfinite(stamp) else 0
+        if abs(stamp - base) <= GRAB_TIME_TOLERANCE:
+            return base
+        print(f"[PROC] Stempel waktu frame pertama video ({stamp:.2f} frame) di batas pembulatan: "
+              f"frame diambil dengan seek seperti semula.")
+        return None
+
+    @staticmethod
+    def _read_video_frame(cap, pos: int, target: int, fps: float, base: Optional[int]):
+        """
+        Baca frame nomor `target` dari file video; `pos` = nomor frame yang akan
+        dikembalikan read() berikutnya, `base` dari _grab_base(). Return
+        (ret, frame, base); base None = sumber ini selalu memakai cap.set().
+
+        Cara semula: cap.set() ke frame target, lalu read(). cap.set()
+        mengosongkan decoder dan mengulang dari keyframe, jadi lompatan pendek
+        ke depan dilewati dengan grab() berurutan (decode saja), yang lebih
+        murah.
+
+        Menghitung grab() hanya memilih frame yang sama dengan cap.set() bila
+        frame rate file itu konstan, karena cap.set() mencari berdasarkan WAKTU:
+        ia mundur ke keyframe, menomori keyframe itu dari stempel waktunya
+        (dibulatkan), lalu maju sampai nomor target. Maka stempel waktu SETIAP
+        frame yang dilewati dicocokkan dengan nomor hitungannya; selama semuanya
+        cocok, kedua cara memilih frame yang sama. Begitu ada yang meleset
+        lebih dari GRAB_TIME_TOLERANCE (file VFR), frame target dibaca ulang
+        dengan cap.set() dan base menjadi None. Lompatan jauh atau mundur juga
+        membuat base None, sebab frame yang terlompati tidak ikut diperiksa.
+        """
+        if base is not None and 0 <= target - pos <= GRAB_MAX_SKIP:
+            for number in range(pos, target + 1):
+                if not cap.grab():
+                    break       # habis sebelum frame target → dipastikan dengan cap.set() di bawah
+                stamp = cap.get(cv2.CAP_PROP_POS_MSEC) * fps / 1000.0 - base
+                if not abs(stamp - number) <= GRAB_TIME_TOLERANCE:
+                    print(f"[PROC] Stempel waktu frame ke-{number} tidak cocok dengan nomornya "
+                          f"({stamp:.2f}; video VFR?): frame diambil dengan seek seperti semula.")
+                    base = None
+                    break
+            else:
+                return (*cap.retrieve(), base)      # grab() terakhir + retrieve() = read()
+        else:
+            base = None
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+        ret, frame = cap.read()
+        # grab() gagal tetapi cap.set() menemukan frame-nya: hitungan dan waktu tidak sejalan
+        return ret, frame, None if ret else base
+
+    def _run_inner(self, cap, source: dict, vehicle_model, triangle_model) -> Optional[dict]:
+        """Satu sumber: frame pertama → ROI → loop tick. Nilai kembali sama dengan _run_source."""
+        is_camera = source.get("type") == "camera"
+        if is_camera and not cap.isOpened() and not self._retry_camera_open(cap, source):
+            return None             # stop(), atau sumber baru (diambil loop pengawas)
+        if not cap.isOpened():
+            raise SourceError(f"Sumber tidak bisa dibuka: {self._describe_source(source)}")
+
+        fps          = cap.get(cv2.CAP_PROP_FPS)
+        if not (math.isfinite(fps) and fps > 0):
+            fps = 25.0
         W            = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         H            = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        is_camera    = source.get("type") == "camera"
         print(f"[PROC] Sumber terbuka: {W}×{H} @ {fps:.1f}fps")
 
         # 4. Baca frame pertama, simpan untuk ROI drawing di frontend
-        ret, first_frame = _read_rot(cap)
-        if not ret:
-            cap.release()
-            return
+        ret, first_frame = cap.read()
+        if not ret and is_camera:
+            first_frame = self._recover_camera(cap, source)
+            if first_frame is None:
+                return None         # stop(), atau sumber baru (diambil loop pengawas)
+        elif not ret:
+            raise SourceError(f"Frame pertama tidak bisa dibaca: {self._describe_source(source)}")
+        if W <= 0 or H <= 0:        # backend tidak melaporkan ukuran → pakai ukuran frame nyata
+            H, W = first_frame.shape[:2]
 
         ok, buf = cv2.imencode('.jpg', first_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
         if ok:
@@ -634,17 +1166,18 @@ class VideoProcessor:
             roi_polygons = self._make_auto_roi(W, H)
             print(f"[PROC] Auto-ROI: seluruh frame ({W}×{H})")
         else:
-            # Manual: tunggu ROI dari frontend
+            # Manual: tunggu ROI dari frontend. Cukup SATU frame diam yang di-push;
+            # video tidak di-decode dan di-encode berulang selama menunggu.
             print("[PROC] Menunggu ROI dari frontend (/set_roi)...")
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            self.shared.set_proc_state("waiting_roi")
+            self._push_hint_frame(first_frame, "Gambar zona larangan parkir di dashboard",
+                                  "Klik titik-titik pada frame → Simpan Zona")
 
             while not self._stop.is_set():
                 # Cek apakah ada source baru (user re-configure)
                 new_src = self.shared.take_source()
                 if new_src:
-                    cap.release()
-                    self._run_inner()
-                    return
+                    return new_src
 
                 roi_raw = self.shared.take_roi()
                 if roi_raw:
@@ -653,33 +1186,21 @@ class VideoProcessor:
                     print(f"[PROC] ROI diterima: {len(roi_polygons)} zona, {n} titik total")
                     break
 
-                ret, placeholder = _read_rot(cap)
-                if ret:
-                    overlay = placeholder.copy()
-                    cv2.putText(overlay, "Gambar zona larangan parkir di dashboard",
-                                (30, H // 2 - 20), cv2.FONT_HERSHEY_SIMPLEX,
-                                0.85, (0, 210, 230), 2, cv2.LINE_AA)
-                    cv2.putText(overlay, "Klik titik-titik pada frame → Simpan Zona",
-                                (30, H // 2 + 20), cv2.FONT_HERSHEY_SIMPLEX,
-                                0.65, (150, 150, 150), 2, cv2.LINE_AA)
-                    self._push_frame(overlay)
-                else:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                time.sleep(0.12)
+                if is_camera:
+                    cap.grab()      # kuras buffer driver supaya frame berikutnya tidak basi
+                self._stop.wait(ROI_POLL_SECONDS)
 
             if self._stop.is_set():
-                cap.release()
-                return
+                return None
 
-        # 6. Reset ke frame awal, baca frame pertama untuk loop
-        if not is_camera:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ret, current_frame = _read_rot(cap)
-        else:
-            current_frame = first_frame
-        if not ret:
-            cap.release()
-            return
+        # 6. Tick pertama memakai frame pertama yang sudah dibaca (file video:
+        #    frame 0, jadi tidak perlu seek + decode ulang ke awal)
+        current_frame = first_frame
+        frame_pos     = 1       # file video: nomor frame yang dibaca read() berikutnya
+        # file video: patokan memilih frame dengan menghitung grab() (lihat _read_video_frame)
+        grab_base     = None if is_camera else self._grab_base(cap, fps)
+        self._push_hint_frame(first_frame, "Memulai deteksi...")
+        self.shared.set_proc_state("running")
 
         # 5. Inisialisasi state tracking
         parked_records:       Dict[int, ParkedRecord] = {}
@@ -688,6 +1209,8 @@ class VideoProcessor:
         next_logical_id       = 1
         last_logic_second     = -1
         tick_second           = 0
+        ticks_done            = 0                       # untuk status "proc"
+        tick_started          = time.perf_counter()     # hanya untuk tick_ms, bukan logika
 
         # 6. Loop utama — sama persis dengan run_video() di demo3_tts.py
         while not self._stop.is_set():
@@ -695,9 +1218,7 @@ class VideoProcessor:
             # Cek apakah ada source baru dari frontend (user re-configure)
             new_src = self.shared.take_source()
             if new_src:
-                cap.release()
-                self._run_inner()
-                return
+                return new_src
 
             # Cek apakah ada update ROI dari frontend (mid-run)
             roi_raw = self.shared.take_roi()
@@ -707,9 +1228,11 @@ class VideoProcessor:
                 tracker_to_logical.clear()
                 cached_triangle.clear()
                 next_logical_id = 1
+                if self._tts is not None:
+                    self._tts.clear()
                 print(f"[PROC] ROI diperbarui: {len(roi_polygons)} zona")
 
-            frame        = current_frame.copy()
+            frame        = current_frame    # hanya dibaca; semua gambar ditulis ke vis
             vis          = frame.copy()
             logic_second = tick_second
             video_second = tick_second
@@ -739,7 +1262,7 @@ class VideoProcessor:
                     if roi_idx is None: continue
                     tracked_now.append({
                         "tracker_id": tid, "bbox": xyxy, "center": (cx, cy),
-                        "cls_name": cls_name, "roi_idx": roi_idx, "color": "unknown",
+                        "cls_name": cls_name, "roi_idx": roi_idx,
                     })
 
             # ── Assignment: tracker_id → logical_id ───────────
@@ -752,7 +1275,6 @@ class VideoProcessor:
                 center   = det["center"]
                 cls_name = det["cls_name"]
                 roi_idx  = det["roi_idx"]
-                cur_col  = det["color"]
                 logical_id = None
 
                 if tid in tracker_to_logical:
@@ -776,12 +1298,12 @@ class VideoProcessor:
                         if ok: logical_id = cid
 
                 if logical_id is None:
-                    h = get_best_hidden_match(bbox, center, cls_name, roi_idx, cur_col,
+                    h = get_best_hidden_match(bbox, center, cls_name, roi_idx,
                                               parked_records, logic_second, used_hidden_ids)
                     if h: logical_id = h; used_hidden_ids.add(h)
 
                 if logical_id is None:
-                    lk = get_locked_hidden_parked_record(bbox, center, cls_name, roi_idx, cur_col,
+                    lk = get_locked_hidden_parked_record(bbox, center, cls_name, roi_idx,
                                                           parked_records, logic_second)
                     if lk: logical_id = lk; used_hidden_ids.add(lk)
 
@@ -801,23 +1323,24 @@ class VideoProcessor:
                 if logical_id is None:
                     logical_id = next_logical_id
                     parked_records[logical_id] = ParkedRecord(
-                        logical_id=logical_id, tracker_id=tid, cls_name=cls_name,
-                        bbox=bbox, center=center, roi_idx=roi_idx, color_name=cur_col,
-                        first_seen_time=logic_second, last_seen_time=logic_second)
+                        tracker_id=tid, cls_name=cls_name,
+                        bbox=bbox, center=center, roi_idx=roi_idx)
                     next_logical_id += 1
                 else:
                     rec = parked_records[logical_id]
                     was_hidden = rec.hidden_since is not None
                     if rec.tracker_id and rec.tracker_id in tracker_to_logical and rec.tracker_id != tid:
                         del tracker_to_logical[rec.tracker_id]
-                    rec.tracker_id = tid; rec.cls_name = cls_name; rec.last_seen_time = logic_second
+                    rec.tracker_id = tid; rec.cls_name = cls_name
+                    # Warna record TIDAK ditimpa di sini (dulu selalu kembali ke
+                    # "unknown" tiap tick, sehingga klasifikasi warna berulang terus).
                     if rec.parked_since is not None and rec.parked_bbox is not None:
                         if bbox_iou(bbox, rec.parked_bbox) >= 0.35:
                             rec.bbox = bbox; rec.center = center
-                            rec.roi_idx = roi_idx; rec.color_name = cur_col
+                            rec.roi_idx = roi_idx
                     else:
                         rec.bbox = bbox; rec.center = center
-                        rec.roi_idx = roi_idx; rec.color_name = cur_col
+                        rec.roi_idx = roi_idx
                     if was_hidden:
                         rec.reappeared_at = logic_second
                         rec.prev_logic_center = rec.center
@@ -858,7 +1381,7 @@ class VideoProcessor:
                 if victim not in parked_records or winner not in parked_records: continue
                 vr, wr = parked_records[victim], parked_records[winner]
                 wr.bbox = vr.bbox; wr.center = vr.center; wr.tracker_id = vr.tracker_id
-                wr.last_seen_time = logic_second; wr.hidden_since = None
+                wr.hidden_since = None
                 wr.reappeared_at = logic_second
                 wr.prev_logic_center = wr.parked_center or wr.center
                 wr.moving_since = None
@@ -873,6 +1396,7 @@ class VideoProcessor:
             # ── Analisis per detik ─────────────────────────────
             if logic_second != last_logic_second:
                 to_delete = []
+                alert_due = []      # (last_alert_time, lid, rec) yang waktunya disuarakan
                 for lid, rec in parked_records.items():
                     if rec.hidden_since is not None:
                         if logic_second - rec.hidden_since > OCCLUSION_TTL_SECONDS:
@@ -908,11 +1432,13 @@ class VideoProcessor:
                                 rr = get_required_moving_reset_seconds(rec, logic_second)
                                 if md >= rr * 1.5:
                                     rec.parked_since = rec.stationary_since = rec.moving_since = None
-                                    rec.triangle_checked = rec.triangle_found = rec.illegal_reported = False
-                                    rec.color_name = "unknown"; rec.color_pct = 0.0
+                                    rec.triangle_checked = rec.triangle_found = rec.illegal_seen = False
+                                    rec.color_name = "unknown"
                                     rec.last_alert_time = -9999
                                     rec.parked_bbox = rec.parked_center = None
                                     cached_triangle.pop(lid, None)
+                                    if self._tts is not None:
+                                        self._tts.cancel(lid)   # pesan yang masih antre sudah basi
                         rec.prev_logic_center = rec.center
 
                     if rec.stationary_since is not None and rec.parked_since is None:
@@ -920,13 +1446,17 @@ class VideoProcessor:
                             rec.parked_since  = rec.stationary_since
                             rec.parked_bbox   = rec.bbox
                             rec.parked_center = rec.center
+                            # Warna pertama bisa berasal dari kendaraan yang masih bergerak /
+                            # terpotong tepi frame: klasifikasi ulang SEKALI saat sudah diam
+                            # (dikerjakan loop "Draw: visible" pada tick ini juga).
+                            rec.color_name    = "unknown"
 
                     parked_duration = get_elapsed_seconds(rec, logic_second)
 
-                    # Triangle check
+                    # Triangle check  (record hidden sudah di-`continue` di awal loop)
                     if (rec.parked_since is not None and
                             parked_duration >= PARKING_CHECK_SECONDS and
-                            not rec.triangle_checked and rec.hidden_since is None):
+                            not rec.triangle_checked):
                         x1, y1, x2, y2 = rec.bbox
                         ex1, ey1, ex2, ey2 = expand_xyxy((x1, y1, x2, y2), W, H, EXPAND_MARGIN)
                         crop = frame[ey1:ey2, ex1:ex2]
@@ -947,19 +1477,24 @@ class VideoProcessor:
                         cached_triangle[lid] = tri_data
                         rec.triangle_checked = True
 
-                    # TTS alert
+                    # TTS alert: dikumpulkan dulu, disuarakan setelah loop ini
                     if (rec.parked_since is not None and
                             parked_duration >= ILLEGAL_PARKING_SECONDS and not rec.triangle_found):
-                        if rec.color_name == "unknown" and rec.hidden_since is None:
-                            x1, y1, x2, y2 = rec.bbox
-                            vc = crop_vehicle_body_for_color(frame[y1:y2, x1:x2])
-                            rec.color_name, rec.color_pct = classify_vehicle_color_hsv(vc, HEURISTIC_SAMPLE_SIZE)
+                        rec.illegal_seen = True
                         if (logic_second - rec.last_alert_time) >= TTS_REPEAT_GAP:
-                            wt = make_warning_text(rec, W)
-                            print(f"[ALERT {logic_second:04d}s] {wt}")
-                            if ENABLE_TTS: speak_once(wt)
-                            rec.last_alert_time = logic_second
-                            rec.illegal_reported = True
+                            alert_due.append((rec.last_alert_time, lid, rec))
+
+                # Adil antar pelanggar: yang paling lama belum disuarakan didahulukan.
+                # last_alert_time hanya maju (dan baris [ALERT] hanya tercetak) bila
+                # pesan benar-benar diterima untuk disuarakan; yang ditolak (antrean
+                # penuh, masih diputar, TTS sedang gagal) dicoba lagi tick berikutnya.
+                # Dengan ENABLE_TTS=false alert hanya dicatat di log, seperti semula.
+                for _, lid, rec in sorted(alert_due, key=lambda due: due[:2]):
+                    wt = make_warning_text(rec)
+                    if self._tts is not None and not self._tts.submit(lid, wt):
+                        continue
+                    print(f"[ALERT {logic_second:04d}s] {wt}")
+                    rec.last_alert_time = logic_second
 
                 for lid in to_delete:
                     del parked_records[lid]
@@ -979,6 +1514,12 @@ class VideoProcessor:
             # ── Draw: visible ──────────────────────────────────
             for lid, rec in parked_records.items():
                 if rec.hidden_since is not None: continue
+                # Klasifikasi warna sekali saja saat masih unknown, supaya
+                # warna langsung tampil di dashboard & label (tidak nunggu 300s).
+                if rec.color_name == "unknown":
+                    cx1, cy1, cx2, cy2 = rec.bbox
+                    vc = crop_vehicle_body_for_color(frame[cy1:cy2, cx1:cx2])
+                    rec.color_name, _ = classify_vehicle_color_hsv(vc, HEURISTIC_SAMPLE_SIZE)
                 pd = get_elapsed_seconds(rec, logic_second)
                 bc, st = choose_status(rec, logic_second)
                 lbl = f"LID{lid}|ROI{rec.roi_idx+1}|{rec.cls_name}|{pd}s|{st}"
@@ -1005,38 +1546,51 @@ class VideoProcessor:
             }
             self.shared.set_alerts(alerts, stats)
 
-            # DEBUG: log per tick supaya ketahuan apakah alerts ter-build
-            n_records = len(parked_records)
-            n_visible = sum(1 for r in parked_records.values() if r.hidden_since is None)
-            if tick_second % 5 == 0 or n_visible > 0:
-                print(f"[PROC t={tick_second:04d}] records={n_records} visible={n_visible} "
-                      f"alerts_out={len(alerts)} stats={stats}")
+            # Status "proc": jumlah tick selesai + lama tick ini (jam nyata, antar publikasi)
+            ticks_done += 1
+            now = time.perf_counter()
+            self.shared.set_proc_tick(ticks_done, round((now - tick_started) * 1000.0, 1))
+            tick_started = now
 
             # ── Maju ke detik berikutnya ──────────────────────────
-            tick_second += 1
             if is_camera:
-                # Kamera: baca frame berikutnya langsung
-                ret, current_frame = _read_rot(cap)
+                # Kamera: 1 tick = 1 frame yang diproses; baca frame berikutnya langsung
+                tick_second += 1
+                ret, current_frame = cap.read()
                 if not ret:
-                    print("[PROC] Kamera gagal baca frame.")
-                    break
+                    current_frame = self._recover_camera(cap, source)
+                    if current_frame is None:
+                        return None     # stop(), atau sumber baru (diambil loop pengawas)
             else:
-                # Video file: lompat ke frame target
+                # Video file: maju TICK_STEP detik video, ambil frame target
+                tick_second += TICK_STEP
                 target_frame = int(round(tick_second * fps))
-                if target_frame >= total_frames:
+                ret = False
+                # total_frames <= 0: jumlah frame tidak diketahui → akhir video
+                # dikenali dari read() yang gagal
+                if total_frames <= 0 or target_frame < total_frames:
+                    ret, current_frame, grab_base = self._read_video_frame(
+                        cap, frame_pos, target_frame, fps, grab_base)
+                    frame_pos = target_frame + 1
+
+                if not ret:
+                    # Akhir video, atau frame target tidak terbaca: ulang dari awal.
+                    # Satu jalur untuk keduanya, supaya state SELALU ikut dikosongkan
+                    # saat tick_second kembali ke 0.
                     print("[PROC] Video selesai — loop dari awal.")
-                    tick_second = 0
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, current_frame = cap.read()
+                    if not ret:
+                        raise SourceError(
+                            f"Video tidak bisa dibaca ulang dari awal: {self._describe_source(source)}")
+                    frame_pos         = 1
+                    tick_second       = 0
+                    last_logic_second = -1
                     parked_records.clear(); tracker_to_logical.clear()
                     cached_triangle.clear(); next_logical_id = 1
-                else:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+                    # State tracker sengaja TIDAK di-reset di sini (sama seperti semula):
+                    # pemetaan tracker_to_logical sudah dikosongkan, ID tracker lanjut naik.
+                    if self._tts is not None:
+                        self._tts.clear()
 
-                ret, current_frame = _read_rot(cap)
-                if not ret:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    tick_second = 0
-                    ret, current_frame = _read_rot(cap)
-                    if not ret: break
-
-        cap.release()
+        return None     # stop()
