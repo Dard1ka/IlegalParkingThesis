@@ -20,7 +20,7 @@ Perubahan utama vs demo3_tts.py:
 from __future__ import annotations
 from collections import OrderedDict
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Optional
 import math, time, asyncio, threading, os, hashlib, re, textwrap, traceback
 
@@ -126,16 +126,44 @@ RELINK_IOU_THRESHOLD               = 0.01
 HIDDEN_PARKED_LOCK_CENTER_DISTANCE = 200
 HIDDEN_PARKED_LOCK_FOOT_DISTANCE   = 120
 
+# ── Penjaga LID ganda, kotak loncat, dan record hantu ─────────
+# Hanya logika record: output YOLO, tracker, ambang 60/300 detik, dan cara
+# menghitung durasi parkir tidak berubah.
+FOUR_WHEEL_CLASSES       = ("car", "truck", "bus")  # kelas yang sering tertukar pada kendaraan yang sama
+DEDUPE_IOU               = 0.70  # dua kotak (beda kelas) bertumpuk segini dalam satu tick = satu kendaraan
+                                 # (NMS per kelas IoU 0,50 → kotak sekelas tidak pernah setinggi ini)
+CROSS_CLASS_IOU          = 0.60  # car/truck/bus boleh dicocokkan lintas kelas bila IoU kotaknya >= ini
+                                 # (kotak ganda / kelas tertukar terukur 0,95-1,00)
+PARKED_MAX_OUTSIDE       = 0.30  # bagian kotak deteksi yang boleh berada di luar kotak parkir record ...
+PARKED_MIN_OUTSIDE_AREA  = 1500  # ... dan luas di luar itu (piksel) baru dihitung meluber
+GHOST_TTL_SECONDS        = 20    # record belum parkir / baru parkir sebentar dibuang setelah tersembunyi segini
+GHOST_MIN_PARKED_SECONDS = 20    # record yang sudah parkir >= ini saat menghilang tetap OCCLUSION_TTL_SECONDS
+
 STATIONARY_DISTANCE_THRESHOLD = 22.0
 STATIONARY_MIN_SECONDS        = 3
 MOVING_RESET_SECONDS          = 4
 REAPPEAR_GRACE_SECONDS        = 4
 
-COLOR_CROP_TRIM_BOTTOM = 0.28
-COLOR_CROP_TRIM_TOP    = 0.08
-COLOR_CROP_TRIM_LEFT   = 0.08
-COLOR_CROP_TRIM_RIGHT  = 0.08
+# Warna kendaraan. Pita bodi = bagian kotak yang dinilai: 30% atas (kaca depan/belakang,
+# atap) dan 30% bawah (ban, bayangan, aspal) dibuang, juga 15% kiri dan kanan (latar /
+# pohon di pinggir kotak).
+COLOR_CROP_TRIM_BOTTOM = 0.30
+COLOR_CROP_TRIM_TOP    = 0.30
+COLOR_CROP_TRIM_LEFT   = 0.15
+COLOR_CROP_TRIM_RIGHT  = 0.15
 HEURISTIC_SAMPLE_SIZE  = 96
+COLOR_DARK_V           = 25     # crop yang SEMUA pikselnya V <= ini = "unknown" (gelap total, mis.
+                                # kamera malam), sama dengan versi lama
+COLOR_CHROMA_MIN_S     = 60     # piksel "berwarna": saturasi HSV (OpenCV, 0-255) minimal ini ...
+COLOR_CHROMA_MIN_V     = 50     # ... dan tidak terlalu gelap (hue piksel gelap tidak bermakna)
+COLOR_CHROMA_MIN_FRAC  = 0.25   # satu rentang hue harus menutup >= 25% pita bodi; lampu rem,
+                                # pelat, dan daun di pinggir kotak tidak cukup luas
+COLOR_WHITE_V60        = 170    # putih: persentil-60 kecerahan piksel akromatik >= ini
+COLOR_BLACK_V50        = 80     # hitam: median kecerahan piksel akromatik < ini; di antaranya abu-abu
+COLOR_VOTE_SAMPLES     = 5      # warna record parkir = mayoritas 5 suara pertama sejak mulai parkir
+                                # (satu suara per tick terlihat: file video step 2 -> durasi 4-12 s,
+                                # kamera / step 1 -> durasi 3-7 s)
+COLOR_SAMPLE_MIN_IOU   = 0.60   # suara ke-2 dst. dilewati bila kotak bergeser / melebar dari parked_bbox
 
 # strip(): "set ENABLE_TTS=false && uvicorn ..." di cmd menyimpan "false " (dengan spasi)
 ENABLE_TTS      = os.environ.get("ENABLE_TTS", "true").strip().lower() not in ("false", "0", "no")
@@ -146,8 +174,8 @@ EDGE_TTS_VOLUME = "+0%"
 EDGE_TTS_PITCH  = "+0Hz"
 TTS_TEMP_DIR    = "outputs/tts_temp"
 TTS_QUEUE_SIZE  = 3        # pesan yang boleh antre (di luar yang sedang diputar)
-TTS_CACHE_MAX   = 64       # file audio (satu per kalimat) yang disimpan di TTS_TEMP_DIR, juga
-                           # antar restart (jenis x warna = maks 52 kalimat)
+TTS_CACHE_MAX   = 128      # file audio (satu per kalimat) yang disimpan di TTS_TEMP_DIR, juga
+                           # antar restart (satu kalimat bisa menyebut beberapa pelanggar sekaligus)
 TTS_BACKOFF_MIN = 30.0     # detik jeda setelah sintesis / pemutaran gagal ...
 TTS_BACKOFF_MAX = 300.0    # ... digandakan tiap gagal lagi, sampai batas ini
 TTS_CLOSE_WAIT  = 2.0      # detik menunggu thread TTS selesai saat processor berhenti
@@ -158,6 +186,7 @@ TTS_END_SLACK   = 1.0      # detik: audio utuh boleh lebih pendek segini dari ak
 # ── Penjadwalan loop (bukan logika deteksi) ───────────────────
 SOURCE_POLL_SECONDS    = 0.2    # jeda cek /configure saat belum ada sumber
 ROI_POLL_SECONDS       = 0.12   # jeda cek /set_roi saat menunggu zona
+UPLOAD_POLL_SECONDS    = 0.2    # jeda cek selesainya unggahan saat tick file video ditunda
 GRAB_MAX_SKIP          = 60     # lompatan frame di atas ini pakai seek, bukan grab() berurutan
                                 # (terukur: 60 grab ≈ biaya satu seek; di atas itu seek lebih murah)
 GRAB_TIME_TOLERANCE    = 0.45   # satuan frame: selisih terbesar yang diterima antara nomor frame hasil
@@ -246,6 +275,21 @@ def bbox_iou(boxA, boxB):
     union = aA + aB - inter
     return inter / union if union > 0 else 0.0
 
+def spills_outside(det_xyxy, ref_xyxy) -> bool:
+    """
+    True bila kotak det banyak meluber keluar kotak ref (kotak parkir record):
+    bagian di luar ref > PARKED_MAX_OUTSIDE dari luas det DAN > PARKED_MIN_OUTSIDE_AREA
+    piksel. Kotak yang menyusut di dalam ref (tertutup sebagian) tidak pernah
+    meluber; kotak kecil (motor jauh) yang bergeser beberapa piksel tertahan
+    oleh syarat luas minimum.
+    """
+    ax1, ay1, ax2, ay2 = map(float, det_xyxy)
+    bx1, by1, bx2, by2 = map(float, ref_xyxy)
+    inter = max(0.0, min(ax2, bx2) - max(ax1, bx1)) * max(0.0, min(ay2, by2) - max(ay1, by1))
+    area  = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    out   = area - inter
+    return out > PARKED_MAX_OUTSIDE * area and out > PARKED_MIN_OUTSIDE_AREA
+
 
 # ── Drawing helpers ────────────────────────────────────────────
 def draw_all_rois(img, roi_list):
@@ -281,8 +325,21 @@ def draw_dashed_box(img, xyxy, color, thickness=2, dash_len=12):
 
 
 # ══════════════════════════════════════════════════════════════
-# COLOR CLASSIFICATION  (sama persis)
+# COLOR CLASSIFICATION
+#
+# Versi lama memilih pemenang dari 12 kelas per piksel dengan ambang V
+# mutlak (hitam < 60, putih >= 200). Bodi putih di bawah bayangan pohon
+# (V 150-230) terbelah ke "white" dan "gray", sehingga kaca, ban, dan
+# bayangan (~30% crop) bisa menang: van putih input4 tercatat "Black".
+# Mobil hitam yang memantulkan langit (V 60-100) jatuh ke "gray".
+# Kosakata (12 warna + "unknown") tidak berubah: warna_label, kalimat
+# TTS, dan COLOR_LABEL di frontend tetap berlaku.
 # ══════════════════════════════════════════════════════════════
+
+# Rentang hue OpenCV (0-179) per warna kromatik, sama dengan versi lama
+HUE_BINS = (("red", 0, 10), ("orange", 11, 20), ("yellow", 21, 35), ("green", 36, 85),
+            ("cyan", 86, 100), ("blue", 101, 130), ("purple", 131, 160), ("pink", 161, 169),
+            ("red", 170, 179))
 
 def crop_vehicle_body_for_color(bgr_crop):
     if bgr_crop is None or bgr_crop.size == 0: return bgr_crop
@@ -295,42 +352,47 @@ def crop_vehicle_body_for_color(bgr_crop):
     return bgr_crop[t:b, l:r]
 
 def classify_vehicle_color_hsv(bgr_crop, sample_size=96):
+    """
+    Warna dari pita bodi (hasil crop_vehicle_body_for_color). Return (nama, persen).
+      0. Crop kosong / < 4 px / gelap total (semua V <= COLOR_DARK_V): "unknown",
+         sama dengan versi lama.
+      1. Kromatik: piksel S >= COLOR_CHROMA_MIN_S dan V >= COLOR_CHROMA_MIN_V
+         dikelompokkan per rentang hue. Bila kelompok terbesar menutup
+         >= COLOR_CHROMA_MIN_FRAC dari SELURUH pita, itulah warnanya.
+      2. Selain itu akromatik, diputuskan dari sebaran kecerahan piksel
+         akromatik (bukan suara per piksel):
+           putih   : persentil-60 V >= COLOR_WHITE_V60
+           hitam   : median V < COLOR_BLACK_V50
+           abu-abu : sisanya (termasuk silver)
+    """
     if bgr_crop is None or bgr_crop.size == 0: return "unknown", 0.0
     h, w = bgr_crop.shape[:2]
     if h < 4 or w < 4: return "unknown", 0.0
     crop = cv2.resize(bgr_crop, (sample_size, sample_size), interpolation=cv2.INTER_AREA)
-    hsv  = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    Hf   = hsv[:, :, 0].astype(np.int32).reshape(-1)
-    Sf   = hsv[:, :, 1].astype(np.int32).reshape(-1)
-    Vf   = hsv[:, :, 2].astype(np.int32).reshape(-1)
-    valid = Vf > 25
-    Hf, Sf, Vf = Hf[valid], Sf[valid], Vf[valid]
-    if Hf.size == 0: return "unknown", 0.0
-    counts = {k: 0 for k in
-              ["black","white","gray","red","orange","yellow","brown","green","cyan","blue","purple","pink"]}
-    black = Vf < 60
-    white = (Sf < 35) & (Vf >= 200)
-    gray  = (Sf < 35) & (Vf >= 60) & (Vf < 200)
-    counts["black"] = int(np.sum(black))
-    counts["white"] = int(np.sum(white))
-    counts["gray"]  = int(np.sum(gray))
-    chroma = ~(black | white | gray)
-    Hc, Sc, Vc = Hf[chroma], Sf[chroma], Vf[chroma]
-    if Hc.size:
-        brown            = (Hc >= 10) & (Hc <= 25) & (Sc > 50) & (Vc < 160)
-        counts["brown"]  = int(np.sum(brown))
-        counts["red"]    = int(np.sum(((Hc <= 10) | (Hc >= 170)) & ~brown))
-        counts["orange"] = int(np.sum((Hc >= 11) & (Hc <= 20) & ~brown))
-        counts["yellow"] = int(np.sum((Hc >= 21) & (Hc <= 35) & ~brown))
-        counts["green"]  = int(np.sum((Hc >= 36) & (Hc <= 85)))
-        counts["cyan"]   = int(np.sum((Hc >= 86) & (Hc <= 100)))
-        counts["blue"]   = int(np.sum((Hc >= 101) & (Hc <= 130)))
-        counts["purple"] = int(np.sum((Hc >= 131) & (Hc <= 160)))
-        counts["pink"]   = int(np.sum((Hc >= 161) & (Hc <= 169)))
-    total = sum(counts.values())
-    if total <= 0: return "unknown", 0.0
-    best, cnt = max(counts.items(), key=lambda kv: kv[1])
-    return best, float(cnt / total * 100)
+    hsv  = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV).reshape(-1, 3).astype(np.int32)
+    H, S, V = hsv[:, 0], hsv[:, 1], hsv[:, 2]
+    n = H.size
+    if not np.any(V > COLOR_DARK_V): return "unknown", 0.0
+
+    chroma = (S >= COLOR_CHROMA_MIN_S) & (V >= COLOR_CHROMA_MIN_V)
+    best, cnt = "unknown", 0
+    if chroma.any():
+        Hc, Vc = H[chroma], V[chroma]
+        brown  = (Hc >= 10) & (Hc <= 25) & (Vc < 160)
+        counts = {"brown": int(np.sum(brown))}
+        for name, lo, hi in HUE_BINS:
+            counts[name] = counts.get(name, 0) + int(np.sum((Hc >= lo) & (Hc <= hi) & ~brown))
+        best, cnt = max(counts.items(), key=lambda kv: kv[1])
+        if cnt >= COLOR_CHROMA_MIN_FRAC * n:
+            return best, float(cnt / n * 100)
+
+    Va = V[~chroma]
+    if Va.size == 0:                    # semua piksel berwarna tetapi tanpa satu hue dominan
+        return best, float(cnt / n * 100)
+    v50, v60 = np.percentile(Va, (50, 60))
+    if v60 >= COLOR_WHITE_V60: return "white", float(np.mean(Va >= COLOR_WHITE_V60) * 100)
+    if v50 <  COLOR_BLACK_V50: return "black", float(np.mean(Va <  COLOR_BLACK_V50) * 100)
+    return "gray", float(Va.size / n * 100)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -355,9 +417,42 @@ class ParkedRecord:
                                      # (hanya dipakai skor relink, lihat get_best_hidden_match)
     last_alert_time:  int  = -9999
     color_name:       str  = "unknown"
+    color_votes:      Dict[str, int] = field(default_factory=dict)   # suara warna sejak reset terakhir
     prev_logic_center: Optional[Tuple[float, float]] = None
     parked_bbox:       Optional[Tuple[int, int, int, int]] = None
     parked_center:     Optional[Tuple[float, float]] = None
+    cls_votes:         Dict[str, int] = field(default_factory=dict)   # kelas → berapa kali terdeteksi
+
+
+def vote_vehicle_color(rec: ParkedRecord, frame: np.ndarray) -> None:
+    """
+    Satu suara warna dari frame ini untuk record yang TERLIHAT (dipanggil loop
+    "Draw: visible" sekali per tick). Suara dikosongkan bersama color_name saat
+    record dibuat, mulai parkir, atau di-reset karena bergerak, jadi
+    "color_votes kosong" selalu sama dengan "color_name == unknown".
+      • Belum parkir: cukup satu suara (seperti dulu: warna langsung tampil).
+      • Parkir: COLOR_VOTE_SAMPLES suara, lalu warna tetap. Suara pertama selalu
+        diambil (di tick transisi kotak = parked_bbox); suara berikutnya dilewati
+        bila kotak bergeser / melebar (IoU dengan parked_bbox < COLOR_SAMPLE_MIN_IOU),
+        mis. kotak yang menempel ke kendaraan lewat.
+    Tick yang kotak record-nya TIDAK mengikuti deteksi (deteksi meluber keluar / bergeser
+    dari kotak parkir) sudah disaring pemanggil, lihat color_skip_ids di _run_inner.
+    rec.color_name = mayoritas sementara; seri -> label yang lebih dulu mendapat
+    suara (urutan dict). Warna tidak dipakai logika waktu / status.
+    """
+    limit = COLOR_VOTE_SAMPLES if rec.parked_since is not None else 1
+    if sum(rec.color_votes.values()) >= limit:
+        return
+    if (rec.color_votes and rec.parked_bbox is not None and
+            bbox_iou(rec.bbox, rec.parked_bbox) < COLOR_SAMPLE_MIN_IOU):
+        return
+    x1, y1, x2, y2 = rec.bbox
+    crop = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
+    name, _ = classify_vehicle_color_hsv(crop_vehicle_body_for_color(crop), HEURISTIC_SAMPLE_SIZE)
+    if name == "unknown":
+        return      # crop terlalu kecil / gelap total: dicoba lagi tick berikutnya (seperti dulu)
+    rec.color_votes[name] = rec.color_votes.get(name, 0) + 1
+    rec.color_name = max(rec.color_votes.items(), key=lambda kv: kv[1])[0]
 
 
 # ══════════════════════════════════════════════════════════════
@@ -388,8 +483,9 @@ class TTSSpeaker:
     """
     Menyuarakan peringatan lewat SATU thread pekerja berumur panjang.
 
-      • Antrean kecil (TTS_QUEUE_SIZE) dan paling banyak satu pesan per
-        logical id, supaya suara tidak tertinggal jauh dari video.
+      • Satu kalimat bisa menyebut beberapa pelanggar sekaligus. Antrean kecil
+        (TTS_QUEUE_SIZE); pesan yang menyebut kendaraan yang sama diganti pesan
+        terbaru, supaya suara tidak tertinggal jauh dari video.
       • submit() mengembalikan True hanya bila pesan diterima untuk
         disuarakan; baru saat itu pemanggil memajukan last_alert_time.
       • Audio disimpan per kalimat di TTS_TEMP_DIR dan tetap dipakai setelah
@@ -409,8 +505,8 @@ class TTSSpeaker:
 
     def __init__(self):
         self._cv = threading.Condition()
-        self._queue: List[Tuple[int, str]] = []                # (logical_id, kalimat)
-        self._speaking: Optional[int] = None                   # logical id yang sedang disuarakan
+        self._queue: List[Tuple[frozenset, str]] = []          # (logical id yang disebut, kalimat)
+        self._speaking: Optional[Tuple[frozenset, str]] = None # yang sedang disuarakan
         self._abort       = False                              # minta suara yang berjalan dihentikan
         self._closed      = False                              # close() sudah dipanggil
         self._cache: OrderedDict[str, None] = OrderedDict()    # path MP3 yang sudah jadi; yang paling
@@ -440,18 +536,25 @@ class TTSSpeaker:
             print(f"[TTS] Folder {TTS_TEMP_DIR} tidak bisa disiapkan: {e}")
 
     # ── Dipanggil dari thread processor ───────────────────────
-    def submit(self, logical_id: int, message: str) -> bool:
-        """True bila pesan diterima untuk disuarakan."""
+    def submit(self, logical_ids, message: str) -> bool:
+        """
+        True bila pesan diterima untuk disuarakan. `logical_ids` = kendaraan yang
+        disebut di kalimat (satu kalimat bisa menyebut beberapa pelanggar).
+        Pesan antrean yang menyebut salah satu kendaraan yang sama diganti
+        pesan ini (daftar pelanggar terbaru), jadi tidak ada kalimat basi.
+        """
+        lids = frozenset(logical_ids)
         with self._cv:
             if self._closed:
                 return False
-            if logical_id == self._speaking or any(lid == logical_id for lid, _ in self._queue):
-                return False                                   # sudah antre / sedang disuarakan
-            if len(self._queue) >= TTS_QUEUE_SIZE:
-                return False                                   # penuh → dicoba lagi tick berikutnya
+            if self._speaking is not None and self._speaking[1] == message:
+                return False                                   # kalimat yang sama sedang disuarakan
             if self._on_hold(message):
                 return False                                   # baru saja gagal → tunggu jedanya habis
-            self._queue.append((logical_id, message))
+            self._queue = [item for item in self._queue if not (item[0] & lids)]
+            if len(self._queue) >= TTS_QUEUE_SIZE:
+                return False                                   # penuh → dicoba lagi tick berikutnya
+            self._queue.append((lids, message))
             if self._thread is None:
                 self._thread = threading.Thread(target=self._run, daemon=True, name="TTSSpeaker")
                 self._thread.start()
@@ -459,9 +562,9 @@ class TTSSpeaker:
             return True
 
     def cancel(self, logical_id: int) -> None:
-        """Kendaraan sudah pergi: pesannya yang masih antre sudah basi."""
+        """Kendaraan sudah pergi: pesan antrean yang menyebutnya sudah basi."""
         with self._cv:
-            self._queue = [item for item in self._queue if item[0] != logical_id]
+            self._queue = [item for item in self._queue if logical_id not in item[0]]
 
     def clear(self) -> None:
         """Sumber / zona berganti atau video diulang: logical id mulai dari 1 lagi."""
@@ -520,8 +623,8 @@ class TTSSpeaker:
                     self._cv.wait()
                 if self._closed:
                     break
-                logical_id, message = self._queue.pop(0)
-                self._speaking, self._abort = logical_id, False
+                logical_ids, message = self._queue.pop(0)
+                self._speaking, self._abort = (logical_ids, message), False
             audio_stage = False
             try:
                 path, from_network = self._audio_for(message)
@@ -651,6 +754,18 @@ def get_elapsed_seconds(rec: ParkedRecord, logic_second: int) -> int:
     if rec.parked_since is None: return 0
     return max(0, logic_second - rec.parked_since)
 
+def hidden_ttl_seconds(rec: ParkedRecord) -> int:
+    """
+    (rec harus tersembunyi) Lama record dipertahankan dan boleh di-relink.
+    Record yang belum parkir, atau baru parkir < GHOST_MIN_PARKED_SECONDS saat
+    menghilang (kendaraan yang hanya berhenti sebentar lalu pergi), dibuang
+    setelah GHOST_TTL_SECONDS. Record yang sudah lama parkir tetap
+    OCCLUSION_TTL_SECONDS dengan durasi penuh, seperti semula.
+    """
+    if rec.parked_since is None or rec.hidden_since - rec.parked_since < GHOST_MIN_PARKED_SECONDS:
+        return GHOST_TTL_SECONDS
+    return OCCLUSION_TTL_SECONDS
+
 def choose_status(rec: ParkedRecord, logic_second: int):
     if rec.parked_since is None: return (255, 200, 0), "monitoring"
     d = get_elapsed_seconds(rec, logic_second)
@@ -667,11 +782,39 @@ def get_required_moving_reset_seconds(rec: ParkedRecord, logic_second: int) -> i
     if d >= PARKING_CHECK_SECONDS:   return 10
     return MOVING_RESET_SECONDS
 
-def make_warning_text(rec: ParkedRecord) -> str:
-    return (
-        f"Mohon untuk {bahasa_label(rec.cls_name)} dengan warna {warna_label(rec.color_name)} "
-        f"untuk tidak parkir di situ atau akan terkena denda karena bukan tempat parkir."
-    )
+ANGKA_KATA = {2: "dua", 3: "tiga", 4: "empat", 5: "lima", 6: "enam", 7: "tujuh", 8: "delapan",
+              9: "sembilan", 10: "sepuluh"}
+
+
+def describe_vehicle(rec: ParkedRecord) -> str:
+    """'mobil berwarna hitam'; warna belum diketahui -> jenisnya saja ('mobil')."""
+    jenis = bahasa_label(rec.cls_name)
+    if rec.color_name and rec.color_name.lower() != "unknown":
+        return f"{jenis} berwarna {warna_label(rec.color_name)}"
+    return jenis
+
+
+def make_warning_text(recs: List[ParkedRecord]) -> str:
+    """
+    SATU kalimat untuk semua kendaraan yang sedang melanggar, urut sesuai urutan
+    `recs`. Deskripsi yang sama digabung dengan jumlahnya:
+      1 -> "Mohon untuk mobil berwarna hitam untuk tidak parkir di situ ..."
+      2 -> "Mohon untuk mobil berwarna hitam dan truk berwarna biru untuk ..."
+      3+ -> "Mohon untuk dua mobil berwarna hitam, truk berwarna biru, dan motor berwarna merah untuk ..."
+    """
+    counts: "OrderedDict[str, int]" = OrderedDict()
+    for rec in recs:
+        d = describe_vehicle(rec)
+        counts[d] = counts.get(d, 0) + 1
+    parts = [d if n == 1 else f"{ANGKA_KATA.get(n, str(n))} {d}" for d, n in counts.items()]
+    if len(parts) == 1:
+        daftar = parts[0]
+    elif len(parts) == 2:
+        daftar = f"{parts[0]} dan {parts[1]}"
+    else:
+        daftar = ", ".join(parts[:-1]) + f", dan {parts[-1]}"
+    return (f"Mohon untuk {daftar} untuk tidak parkir di situ atau akan terkena denda "
+            f"karena bukan tempat parkir.")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -682,6 +825,47 @@ def make_warning_text(rec: ParkedRecord) -> str:
 # kendaraan terlihat berstatus ILEGAL. Efek itu dipertahankan lewat
 # rec.illegal_seen, supaya hasil relink tidak berubah)
 # ══════════════════════════════════════════════════════════════
+
+def class_compatible(rec_cls: str, det_cls: str, iou: float) -> bool:
+    """
+    Bolehkah deteksi kelas det_cls dicocokkan ke record berlabel rec_cls?
+    Kelas sama → boleh (perilaku semula). car/truck/bus sering tertukar pada
+    kendaraan yang sama (Innova car↔truck, L300 truck↔bus↔car; IoU 0,95-1,00),
+    jadi boleh lintas kelas asal kotaknya hampir sama (IoU >= CROSS_CLASS_IOU).
+    Motor tidak pernah dicocokkan dengan kendaraan roda empat.
+    """
+    if rec_cls == det_cls:
+        return True
+    return (rec_cls in FOUR_WHEEL_CLASSES and det_cls in FOUR_WHEEL_CLASSES
+            and iou >= CROSS_CLASS_IOU)
+
+def dedupe_tracked_boxes(tracked_now, tracker_to_logical, parked_records, logic_second):
+    """
+    NMS YOLO dihitung per kelas, jadi satu kendaraan bisa keluar dua kali dalam
+    satu frame dengan kelas berbeda (L300 truck + bus/car, Innova car + truck) dan
+    kedua kotak bisa mendapat id tracker sendiri → LID ganda. Kotak yang bertumpuk
+    IoU >= DEDUPE_IOU dianggap satu kendaraan. Yang dipakai: kotak yang id
+    tracker-nya sudah terhubung ke record (durasi terlama, lalu LID terlama), lalu
+    confidence, lalu luas. Urutan semula dipertahankan. Hanya daftar milik logika
+    ini yang disaring: output YOLO dan state tracker tidak berubah.
+    """
+    if len(tracked_now) < 2:
+        return tracked_now
+
+    def _priority(det):
+        x1, y1, x2, y2 = det["bbox"]
+        area = (x2 - x1) * (y2 - y1)
+        lid  = tracker_to_logical.get(det["tracker_id"])
+        rec  = parked_records.get(lid) if lid is not None else None
+        if rec is None:
+            return (0, 0, 0, det["conf"], area)
+        return (1, get_elapsed_seconds(rec, logic_second), -lid, det["conf"], area)
+
+    kept = []
+    for det in sorted(tracked_now, key=_priority, reverse=True):
+        if all(bbox_iou(det["bbox"], k["bbox"]) < DEDUPE_IOU for k in kept):
+            kept.append(det)
+    return [det for det in tracked_now if any(det is k for k in kept)]
 
 def get_best_hidden_match(det_bbox, det_center, det_cls_name, det_roi_idx,
                           parked_records, logic_second, used_hidden_ids):
@@ -698,6 +882,11 @@ def get_best_hidden_match(det_bbox, det_center, det_cls_name, det_roi_idx,
 
     def _ok(rec, cd, fd, iou):
         if cd > RELINK_MAX_DISTANCE: return False
+        if not class_compatible(rec.cls_name, det_cls_name, iou): return False
+        if rec.hidden_since == logic_second:
+            # Baru hilang di tick ini (masih terlihat tick lalu): hanya ID switch
+            # di tempat yang sama, jadi kotaknya harus bertumpuk dengan kotak record.
+            return iou >= 0.30
         if rec.parked_since is not None:
             return iou >= 0.30 or (cd <= 120 and fd <= 140)
         return not (iou < RELINK_IOU_THRESHOLD
@@ -719,8 +908,7 @@ def get_best_hidden_match(det_bbox, det_center, det_cls_name, det_roi_idx,
     best_id, best_s = None, -1e18
     for lid, rec in parked_records.items():
         if lid in used_hidden_ids or rec.hidden_since is None: continue
-        if logic_second - rec.hidden_since > OCCLUSION_TTL_SECONDS: continue
-        if rec.cls_name != det_cls_name: continue
+        if logic_second - rec.hidden_since > hidden_ttl_seconds(rec): continue
         if det_roi_idx is not None and rec.roi_idx != det_roi_idx: continue
         if rec.parked_since is None: continue
         cd, fd, iou = _eval(rec)
@@ -732,8 +920,7 @@ def get_best_hidden_match(det_bbox, det_center, det_cls_name, det_roi_idx,
     # Pass 2: record yang belum parked
     for lid, rec in parked_records.items():
         if lid in used_hidden_ids or rec.hidden_since is None: continue
-        if logic_second - rec.hidden_since > OCCLUSION_TTL_SECONDS: continue
-        if rec.cls_name != det_cls_name: continue
+        if logic_second - rec.hidden_since > hidden_ttl_seconds(rec): continue
         if det_roi_idx is not None and rec.roi_idx != det_roi_idx: continue
         if rec.parked_since is not None: continue
         cd, fd, iou = _eval(rec)
@@ -743,19 +930,21 @@ def get_best_hidden_match(det_bbox, det_center, det_cls_name, det_roi_idx,
     return best_id
 
 def get_locked_hidden_parked_record(det_bbox, det_center, det_cls_name, det_roi_idx,
-                                    parked_records, logic_second):
+                                    parked_records, logic_second, used_hidden_ids):
     det_foot = foot_point(det_bbox)
     best_id, best_s = None, 1e18
     for lid, rec in parked_records.items():
+        if lid in used_hidden_ids: continue
         if rec.hidden_since is None or rec.parked_since is None: continue
-        if logic_second - rec.hidden_since > OCCLUSION_TTL_SECONDS: continue
-        if rec.cls_name != det_cls_name or rec.roi_idx != det_roi_idx: continue
+        if logic_second - rec.hidden_since > hidden_ttl_seconds(rec): continue
+        if rec.roi_idx != det_roi_idx: continue
         ref_bbox   = rec.parked_bbox or rec.bbox
         ref_center = rec.parked_center or rec.center
         cd  = euclidean(det_center, ref_center)
         fd  = euclidean(det_foot, foot_point(ref_bbox))
         iou = bbox_iou(det_bbox, ref_bbox)
         if iou < 0.30: continue
+        if not class_compatible(rec.cls_name, det_cls_name, iou): continue
         if cd <= HIDDEN_PARKED_LOCK_CENTER_DISTANCE or fd <= HIDDEN_PARKED_LOCK_FOOT_DISTANCE:
             s = cd + fd * 2 - iou * 500
             if s < best_s: best_s, best_id = s, lid
@@ -1232,6 +1421,22 @@ class VideoProcessor:
                     self._tts.clear()
                 print(f"[PROC] ROI diperbarui: {len(roi_polygons)} zona")
 
+            # Video baru sedang diunggah (PUT /upload/stream): tick FILE VIDEO
+            # ditunda supaya CPU dipakai unggahan. Hanya menunda: frame, urutan,
+            # dan detik video tiap tick tetap sama, jadi hasil deteksi tidak
+            # berubah. Kamera tidak ditunda (cara hitung waktu kamera tetap).
+            if not is_camera and self.shared.upload_active():
+                self.shared.set_proc_state("paused")
+                print("[PROC] Deteksi ditunda selama video baru diunggah...")
+                paused_at = time.perf_counter()
+                while (self.shared.upload_active() and not self._stop.is_set()
+                       and not self.shared.has_source_pending()):
+                    self._stop.wait(UPLOAD_POLL_SECONDS)
+                self.shared.set_proc_state("running")
+                print("[PROC] Unggahan selesai, deteksi dilanjutkan.")
+                tick_started += time.perf_counter() - paused_at   # lama jeda tidak masuk tick_ms
+                continue                            # cek ulang sumber / ROI baru dulu
+
             frame        = current_frame    # hanya dibaca; semua gambar ditulis ke vis
             vis          = frame.copy()
             logic_second = tick_second
@@ -1251,6 +1456,7 @@ class VideoProcessor:
                 xyxy_arr = boxes.xyxy.cpu().numpy().astype(int)
                 cls_arr  = boxes.cls.cpu().numpy().astype(int)
                 id_arr   = boxes.id.cpu().numpy().astype(int) if boxes.id is not None else None
+                conf_arr = boxes.conf.cpu().numpy()
                 for i in range(len(boxes)):
                     tid = int(id_arr[i]) if id_arr is not None else None
                     if tid is None: continue
@@ -1262,40 +1468,77 @@ class VideoProcessor:
                     if roi_idx is None: continue
                     tracked_now.append({
                         "tracker_id": tid, "bbox": xyxy, "center": (cx, cy),
-                        "cls_name": cls_name, "roi_idx": roi_idx,
+                        "cls_name": cls_name, "roi_idx": roi_idx, "conf": float(conf_arr[i]),
                     })
+            tracked_now = dedupe_tracked_boxes(tracked_now, tracker_to_logical,
+                                               parked_records, logic_second)
 
             # ── Assignment: tracker_id → logical_id ───────────
             visible_logical_ids = set()
             used_hidden_ids     = set()
+            color_skip_ids      = set()     # record terlihat yang kotaknya tidak mengikuti deteksi
+                                            # tick ini (meluber / bergeser): tanpa suara warna
 
-            for det in tracked_now:
+            # Tahap 1: deteksi yang id tracker-nya sudah terhubung ke record
+            # (pemeriksaan sama dengan semula, kelas car/truck/bus boleh tertukar).
+            claims: Dict[int, int] = {}     # logical id → indeks deteksi yang memakainya
+            held = set()                    # indeks deteksi yang diabaikan pada tick ini
+            for i, det in enumerate(tracked_now):
+                tid, bbox = det["tracker_id"], det["bbox"]
+                cls_name, roi_idx = det["cls_name"], det["roi_idx"]
+                cid = tracker_to_logical.get(tid)
+                if cid is None or cid not in parked_records:
+                    continue
+                crec, ok = parked_records[cid], True
+                if crec.parked_since is not None and crec.parked_bbox is not None:
+                    if bbox_iou(bbox, crec.parked_bbox) < 0.30: ok = False
+                if ok:
+                    c_dur = get_elapsed_seconds(crec, logic_second)
+                    b_lid, b_iou, b_dur = None, 0.0, 0
+                    for ol, orec in parked_records.items():
+                        if (ol == cid or ol in claims or orec.parked_since is None or
+                                orec.parked_bbox is None or orec.hidden_since is None or
+                                orec.roi_idx != roi_idx): continue
+                        if logic_second - orec.hidden_since > hidden_ttl_seconds(orec): continue
+                        oi = bbox_iou(bbox, orec.parked_bbox)
+                        if not class_compatible(orec.cls_name, cls_name, oi): continue
+                        od = get_elapsed_seconds(orec, logic_second)
+                        if oi > b_iou: b_iou, b_lid, b_dur = oi, ol, od
+                    if b_lid and b_iou >= 0.20 and b_dur > c_dur: ok = False
+                if not ok:
+                    continue
+                if cid in claims:
+                    # Dua id tracker menunjuk record yang sama: id utama record yang
+                    # dipakai, yang lain diabaikan tick ini (id-nya tetap terhubung).
+                    if tid != crec.tracker_id:
+                        held.add(i)
+                        continue
+                    held.add(claims[cid])
+                claims[cid] = i
+            pre_assigned = {i: cid for cid, i in claims.items()}
+            visible_logical_ids.update(claims)
+            used_hidden_ids.update(claims)
+
+            # Record yang terlihat di tick sebelumnya tetapi tidak diklaim di tahap 1
+            # ditandai tersembunyi MULAI tick ini, supaya di tahap 2 deteksi dengan id
+            # tracker baru (ID switch, kelas berganti) bisa di-relink ke record itu
+            # pada tick ini juga. Dulu baru bisa tick berikutnya, dan kotak kedua dari
+            # kendaraan parkir hanya dikenali bila id-nya kebetulan diproses lebih dulu
+            # (urutan confidence YOLO) → LID ganda (sedan input1, L300 input4).
+            for lid, rec in parked_records.items():
+                if lid not in visible_logical_ids and rec.hidden_since is None:
+                    rec.hidden_since = logic_second
+
+            # Tahap 2: pasang deteksi tahap 1, relink / record baru untuk sisanya.
+            for i, det in enumerate(tracked_now):
+                if i in held:
+                    continue
                 tid      = det["tracker_id"]
                 bbox     = det["bbox"]
                 center   = det["center"]
                 cls_name = det["cls_name"]
                 roi_idx  = det["roi_idx"]
-                logical_id = None
-
-                if tid in tracker_to_logical:
-                    cid = tracker_to_logical[tid]
-                    if cid in parked_records:
-                        crec, ok = parked_records[cid], True
-                        if crec.parked_since is not None and crec.parked_bbox is not None:
-                            if bbox_iou(bbox, crec.parked_bbox) < 0.30: ok = False
-                        if ok:
-                            c_dur = get_elapsed_seconds(crec, logic_second)
-                            b_lid, b_iou, b_dur = None, 0.0, 0
-                            for ol, orec in parked_records.items():
-                                if (ol == cid or orec.parked_since is None or
-                                        orec.parked_bbox is None or orec.hidden_since is None or
-                                        orec.cls_name != cls_name or orec.roi_idx != roi_idx): continue
-                                if logic_second - orec.hidden_since > OCCLUSION_TTL_SECONDS: continue
-                                oi = bbox_iou(bbox, orec.parked_bbox)
-                                od = get_elapsed_seconds(orec, logic_second)
-                                if oi > b_iou: b_iou, b_lid, b_dur = oi, ol, od
-                            if b_lid and b_iou >= 0.20 and b_dur > c_dur: ok = False
-                        if ok: logical_id = cid
+                logical_id = pre_assigned.get(i)
 
                 if logical_id is None:
                     h = get_best_hidden_match(bbox, center, cls_name, roi_idx,
@@ -1304,7 +1547,7 @@ class VideoProcessor:
 
                 if logical_id is None:
                     lk = get_locked_hidden_parked_record(bbox, center, cls_name, roi_idx,
-                                                          parked_records, logic_second)
+                                                          parked_records, logic_second, used_hidden_ids)
                     if lk: logical_id = lk; used_hidden_ids.add(lk)
 
                 if logical_id is None:
@@ -1312,35 +1555,61 @@ class VideoProcessor:
                     for vl in visible_logical_ids:
                         if vl not in parked_records: continue
                         vr = parked_records[vl]
-                        if vr.cls_name != cls_name or vr.roi_idx != roi_idx or vr.parked_since is None: continue
+                        if vr.roi_idx != roi_idx or vr.parked_since is None: continue
                         ref  = vr.parked_bbox or vr.bbox
                         iouvv = bbox_iou(bbox, ref)
-                        if iouvv >= 0.30:
+                        if (iouvv >= 0.30 and class_compatible(vr.cls_name, cls_name, iouvv)
+                                and not spills_outside(bbox, ref)):
                             s = iouvv * 500 + get_elapsed_seconds(vr, logic_second) * 8
                             if s > bvs: bvs, bvl = s, vl
-                    if bvl: logical_id = bvl
+                    if bvl:
+                        # Kotak kedua dari kendaraan parkir yang sudah terlihat (kotak
+                        # sebagian sedan input1, kotak kelas lain L300): diabaikan; kotak
+                        # dan id tracker record itu tidak diganti.
+                        continue
 
                 if logical_id is None:
                     logical_id = next_logical_id
                     parked_records[logical_id] = ParkedRecord(
                         tracker_id=tid, cls_name=cls_name,
-                        bbox=bbox, center=center, roi_idx=roi_idx)
+                        bbox=bbox, center=center, roi_idx=roi_idx,
+                        cls_votes={cls_name: 1})
                     next_logical_id += 1
                 else:
                     rec = parked_records[logical_id]
-                    was_hidden = rec.hidden_since is not None
-                    if rec.tracker_id and rec.tracker_id in tracker_to_logical and rec.tracker_id != tid:
+                    # hidden_since == logic_second: baru ditandai di atas (record terlihat
+                    # di tick sebelumnya, hanya id tracker-nya berganti) → bukan "muncul lagi".
+                    was_hidden = rec.hidden_since is not None and rec.hidden_since < logic_second
+                    if (rec.tracker_id is not None and rec.tracker_id != tid
+                            and tracker_to_logical.get(rec.tracker_id) == logical_id):
                         del tracker_to_logical[rec.tracker_id]
-                    rec.tracker_id = tid; rec.cls_name = cls_name
+                    rec.tracker_id = tid
                     # Warna record TIDAK ditimpa di sini (dulu selalu kembali ke
                     # "unknown" tiap tick, sehingga klasifikasi warna berulang terus).
                     if rec.parked_since is not None and rec.parked_bbox is not None:
-                        if bbox_iou(bbox, rec.parked_bbox) >= 0.35:
+                        # Kotak record parkir hanya mengikuti deteksi yang tetap di dalam
+                        # kotak parkirnya. Deteksi yang meluber keluar (kendaraan lewat yang
+                        # membawa id tracker-nya: Brio input2, MPV/motor input4, Brio merah
+                        # input3) tetap dihitung sebagai record ini, tetapi kotak, pusat,
+                        # dan kelasnya tidak ikut pindah, dan tick ini tidak memberi suara
+                        # warna (kotak lama bisa tertutup kendaraan lewat itu).
+                        box_ok = (bbox_iou(bbox, rec.parked_bbox) >= 0.35
+                                  and not spills_outside(bbox, rec.parked_bbox))
+                        if box_ok:
                             rec.bbox = bbox; rec.center = center
                             rec.roi_idx = roi_idx
                     else:
+                        box_ok = True
                         rec.bbox = bbox; rec.center = center
                         rec.roi_idx = roi_idx
+                    if box_ok:
+                        # Label jenis = kelas yang paling sering terdeteksi (seri → label
+                        # lama), supaya tidak berganti car/truck/bus setiap tick.
+                        rec.cls_votes[cls_name] = rec.cls_votes.get(cls_name, 0) + 1
+                        if rec.cls_votes[cls_name] > rec.cls_votes.get(rec.cls_name, 0):
+                            rec.cls_name = cls_name
+                    else:
+                        color_skip_ids.add(logical_id)
                     if was_hidden:
                         rec.reappeared_at = logic_second
                         rec.prev_logic_center = rec.center
@@ -1365,13 +1634,18 @@ class VideoProcessor:
                 bhl, bhd = None, vd
                 for hl, hr in parked_records.items():
                     if (hl == vl or hr.hidden_since is None or hr.parked_since is None or
-                            hr.cls_name != vr.cls_name or hr.roi_idx != vr.roi_idx): continue
-                    if logic_second - hr.hidden_since > OCCLUSION_TTL_SECONDS: continue
+                            hr.roi_idx != vr.roi_idx): continue
+                    if logic_second - hr.hidden_since > hidden_ttl_seconds(hr): continue
                     hd = get_elapsed_seconds(hr, logic_second)
                     if hd <= bhd: continue
                     href = hr.parked_bbox or hr.bbox
                     vref = vr.parked_bbox or vr.bbox
                     iouvv = bbox_iou(vref, href)
+                    if not class_compatible(hr.cls_name, vr.cls_name, iouvv): continue
+                    # Kendaraan lain yang parkir di sebelah / di depan record lama (kotak
+                    # parkirnya sebagian besar di luar kotak record lama) tidak boleh
+                    # mewarisi waktu record itu lewat merge (dulu cukup pusat <= 150 px).
+                    if spills_outside(vref, href): continue
                     cd = euclidean(vr.parked_center or vr.center, hr.parked_center or hr.center)
                     if iouvv >= 0.20 or cd <= 150:
                         if hd > bhd: bhd, bhl = hd, hl
@@ -1380,7 +1654,13 @@ class VideoProcessor:
             for victim, winner in merge_pairs:
                 if victim not in parked_records or winner not in parked_records: continue
                 vr, wr = parked_records[victim], parked_records[winner]
-                wr.bbox = vr.bbox; wr.center = vr.center; wr.tracker_id = vr.tracker_id
+                if not spills_outside(vr.bbox, wr.parked_bbox or wr.bbox):
+                    wr.bbox = vr.bbox; wr.center = vr.center    # kotak tidak loncat lewat merge
+                    if victim in color_skip_ids:
+                        color_skip_ids.add(winner)      # kotak victim sendiri tidak dari deteksi tick ini
+                else:
+                    color_skip_ids.add(winner)          # kotak winner tidak diperbarui: tanpa suara warna
+                wr.tracker_id = vr.tracker_id
                 wr.hidden_since = None
                 wr.reappeared_at = logic_second
                 wr.prev_logic_center = wr.parked_center or wr.center
@@ -1396,11 +1676,11 @@ class VideoProcessor:
             # ── Analisis per detik ─────────────────────────────
             if logic_second != last_logic_second:
                 to_delete = []
-                alert_due = []      # (last_alert_time, lid, rec) yang waktunya disuarakan
+                violators = []      # (lid, rec) yang sedang melanggar dan terlihat tick ini
                 for lid, rec in parked_records.items():
                     if rec.hidden_since is not None:
-                        if logic_second - rec.hidden_since > OCCLUSION_TTL_SECONDS:
-                            if rec.tracker_id and rec.tracker_id in tracker_to_logical:
+                        if logic_second - rec.hidden_since > hidden_ttl_seconds(rec):
+                            if tracker_to_logical.get(rec.tracker_id) == lid:   # id bisa sudah dipakai record lain
                                 del tracker_to_logical[rec.tracker_id]
                             cached_triangle.pop(lid, None)
                             to_delete.append(lid)
@@ -1434,6 +1714,7 @@ class VideoProcessor:
                                     rec.parked_since = rec.stationary_since = rec.moving_since = None
                                     rec.triangle_checked = rec.triangle_found = rec.illegal_seen = False
                                     rec.color_name = "unknown"
+                                    rec.color_votes.clear()
                                     rec.last_alert_time = -9999
                                     rec.parked_bbox = rec.parked_center = None
                                     cached_triangle.pop(lid, None)
@@ -1446,10 +1727,12 @@ class VideoProcessor:
                             rec.parked_since  = rec.stationary_since
                             rec.parked_bbox   = rec.bbox
                             rec.parked_center = rec.center
-                            # Warna pertama bisa berasal dari kendaraan yang masih bergerak /
-                            # terpotong tepi frame: klasifikasi ulang SEKALI saat sudah diam
-                            # (dikerjakan loop "Draw: visible" pada tick ini juga).
+                            # Warna diulang dari nol saat kendaraan mulai diam: suara saat masih
+                            # bergerak / terpotong tepi frame dibuang, lalu COLOR_VOTE_SAMPLES
+                            # tick terlihat pertama sejak parkir menentukan warnanya (suara
+                            # pertama diambil loop "Draw: visible" pada tick ini juga).
                             rec.color_name    = "unknown"
+                            rec.color_votes.clear()
 
                     parked_duration = get_elapsed_seconds(rec, logic_second)
 
@@ -1457,7 +1740,10 @@ class VideoProcessor:
                     if (rec.parked_since is not None and
                             parked_duration >= PARKING_CHECK_SECONDS and
                             not rec.triangle_checked):
-                        x1, y1, x2, y2 = rec.bbox
+                        # Potongan diambil dari kotak saat mulai parkir (tetap), bukan kotak deteksi
+                        # tick ini: kotak sesaat bisa bergeser beberapa piksel dan model segitiga
+                        # (ambang 0,20) bisa salah menembak lampu belakang kendaraan
+                        x1, y1, x2, y2 = rec.parked_bbox or rec.bbox
                         ex1, ey1, ex2, ey2 = expand_xyxy((x1, y1, x2, y2), W, H, EXPAND_MARGIN)
                         crop = frame[ey1:ey2, ex1:ex2]
                         tri_data = []
@@ -1477,24 +1763,28 @@ class VideoProcessor:
                         cached_triangle[lid] = tri_data
                         rec.triangle_checked = True
 
-                    # TTS alert: dikumpulkan dulu, disuarakan setelah loop ini
+                    # TTS alert: semua pelanggar yang terlihat dikumpulkan dulu (record
+                    # hidden sudah di-`continue` di awal loop), disuarakan setelah loop ini
                     if (rec.parked_since is not None and
                             parked_duration >= ILLEGAL_PARKING_SECONDS and not rec.triangle_found):
                         rec.illegal_seen = True
-                        if (logic_second - rec.last_alert_time) >= TTS_REPEAT_GAP:
-                            alert_due.append((rec.last_alert_time, lid, rec))
+                        violators.append((lid, rec))
 
-                # Adil antar pelanggar: yang paling lama belum disuarakan didahulukan.
-                # last_alert_time hanya maju (dan baris [ALERT] hanya tercetak) bila
-                # pesan benar-benar diterima untuk disuarakan; yang ditolak (antrean
-                # penuh, masih diputar, TTS sedang gagal) dicoba lagi tick berikutnya.
+                # Satu kalimat untuk SEMUA pelanggar yang terlihat, diucapkan bila ada
+                # satu saja yang sudah TTS_REPEAT_GAP detik tidak disebut (pelanggar
+                # baru = langsung). Urutan: yang paling dulu parkir disebut lebih dulu.
+                # last_alert_time semua yang disebut hanya maju (dan baris [ALERT] hanya
+                # tercetak) bila pesan benar-benar diterima untuk disuarakan; yang ditolak
+                # (masih diputar, TTS sedang gagal) dicoba lagi tick berikutnya.
                 # Dengan ENABLE_TTS=false alert hanya dicatat di log, seperti semula.
-                for _, lid, rec in sorted(alert_due, key=lambda due: due[:2]):
-                    wt = make_warning_text(rec)
-                    if self._tts is not None and not self._tts.submit(lid, wt):
-                        continue
-                    print(f"[ALERT {logic_second:04d}s] {wt}")
-                    rec.last_alert_time = logic_second
+                if any((logic_second - rec.last_alert_time) >= TTS_REPEAT_GAP for _, rec in violators):
+                    violators.sort(key=lambda v: (v[1].parked_since, v[0]))
+                    wt = make_warning_text([rec for _, rec in violators])
+                    lids = frozenset(lid for lid, _ in violators)
+                    if self._tts is None or self._tts.submit(lids, wt):
+                        print(f"[ALERT {logic_second:04d}s] {wt}")
+                        for _, rec in violators:
+                            rec.last_alert_time = logic_second
 
                 for lid in to_delete:
                     del parked_records[lid]
@@ -1514,12 +1804,12 @@ class VideoProcessor:
             # ── Draw: visible ──────────────────────────────────
             for lid, rec in parked_records.items():
                 if rec.hidden_since is not None: continue
-                # Klasifikasi warna sekali saja saat masih unknown, supaya
-                # warna langsung tampil di dashboard & label (tidak nunggu 300s).
-                if rec.color_name == "unknown":
-                    cx1, cy1, cx2, cy2 = rec.bbox
-                    vc = crop_vehicle_body_for_color(frame[cy1:cy2, cx1:cx2])
-                    rec.color_name, _ = classify_vehicle_color_hsv(vc, HEURISTIC_SAMPLE_SIZE)
+                # Warna: satu suara per tick sampai cukup (lihat vote_vehicle_color);
+                # suara pertama langsung mengisi warna, jadi label tampil sejak tick ini.
+                # Record yang kotaknya tidak mengikuti deteksi tick ini (color_skip_ids:
+                # deteksi meluber keluar / bergeser dari kotak parkir) tidak memberi suara.
+                if lid not in color_skip_ids:
+                    vote_vehicle_color(rec, frame)
                 pd = get_elapsed_seconds(rec, logic_second)
                 bc, st = choose_status(rec, logic_second)
                 lbl = f"LID{lid}|ROI{rec.roi_idx+1}|{rec.cls_name}|{pd}s|{st}"

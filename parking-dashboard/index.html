@@ -3,28 +3,11 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Smart Parking Command Center</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <!--
-      Font dimuat TANPA menahan render: stylesheet diminta sebagai media="print"
-      (tidak memblokir first paint), lalu diaktifkan untuk layar begitu selesai
-      dimuat. Dashboard langsung tampil dengan font fallback dan berganti
-      (display=swap) saat font tiba — penting kalau internet lambat / putus.
-      <noscript> = cara biasa untuk browser tanpa JavaScript.
-    -->
-    <link
-      href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600&display=swap"
-      rel="stylesheet"
-      media="print"
-      onload="this.media='all'"
-    />
-    <noscript>
-      <link
-        href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600&display=swap"
-        rel="stylesheet"
-      />
-    </noscript>
+    <meta name="color-scheme" content="dark light" />
+    <title>Parking Guard</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <!-- Overpass dibundel lewat @fontsource (lihat src/main.jsx) dan Segoe UI
+         bawaan Windows, jadi tetap tampil saat mesin offline. Tidak ada CDN font. -->
   </head>
   <body>
     <div id="root"></div>

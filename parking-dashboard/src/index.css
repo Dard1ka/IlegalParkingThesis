@@ -2,152 +2,565 @@
 @tailwind components;
 @tailwind utilities;
 
-/* ─── Design Tokens ─────────────────────────────── */
+/* ════════════════════════════════════════════════════════════════
+   Parking Guard, desain "Rambu menyala"
+   Aturan render (mini PC tanpa akselerasi GPU di browser, semua frame
+   digambar CPU):
+     • Hanya isian warna polos, border 1 px, teks, dan SVG kecil. TIDAK ada
+       gradien, blur, filter, backdrop-filter, animasi berulang, atau
+       transisi apa pun: hover dan tekan = ganti warna seketika.
+     • Bayangan hanya dua, statis: baris opsi terpilih (inset 1 px) dan
+       cincin fokus kanvas zona (inset 4 px hitam).
+     • Animasi hanya dua, sekali jalan, opacity saja: tintIn 200 ms (baris
+       yang baru masuk pelanggaran) dan dlgIn 150 ms (dialog zona dibuka).
+       ?lite dan prefers-reduced-motion menolkan keduanya (bawah file ini).
+   Warna: abu-abu tanpa kroma. Merah hanya untuk Pelanggaran, kuning hanya
+   untuk Peringatan. --cv-* sama persis dengan warna kotak yang dibakar
+   backend ke frame video.
+   ════════════════════════════════════════════════════════════════ */
+
+/* ─── Token ─────────────────────────────────────── */
 :root {
-  /* Backgrounds — softer, less harsh */
-  --void:        #08090f;
-  --card:        #13162280;
-  --edge:        rgba(255,255,255,0.06);
-  --edge-bright: rgba(255,255,255,0.10);
+  color-scheme: dark light;
+  --font-ui:   'Segoe UI', system-ui, -apple-system, 'Noto Sans', sans-serif;
+  --font-sign: 'Overpass Variable', 'Segoe UI', sans-serif;
+  --font-num:  var(--font-sign);          /* ganti ke var(--font-ui) kalau cek tnum Overpass gagal */
 
-  /* Accent colors — sedikit lebih muted, masih pop */
-  --cyan:        #22d3ee;
-  --amber:       #fbbf24;
-  --red:         #f87171;
-  --red-soft:    rgba(248, 113, 113, 0.12);
-  --green:       #4ade80;
-  --green-soft:  rgba(74, 222, 128, 0.12);
-  --purple:      #a78bfa;
-  --purple-soft: rgba(167, 139, 250, 0.10);
+  /* Tetap: benda fisik dan legenda video. Sama di kedua tema. */
+  --sign-red:   #C1121C;  /* RAL 3020 traffic red */
+  --sign-white: #F7FBF5;  /* RAL 9016 */
+  --sign-black: #161616;
+  --warn-fill:  #FFD400;  /* kuning rambu peringatan, selalu bertepi #161616 */
+  --well:       #000000;  /* monitor CCTV: letterbox + strip legenda */
+  --on-well:    #EDEDED;
+  --on-well-2:  #B9B9B9;
+  --well-line:  #808080;
+  --cv-zone: #00FFFF; --cv-memantau: #00C8FF; --cv-peringatan: #FFFF00;
+  --cv-aman: #00FF00; --cv-pelanggaran: #FF0000; --cv-luar: #787878;
 
-  /* Typography */
-  --text:        #e2e8f0;
-  --text-dim:    rgba(226, 232, 240, 0.45);
-  --text-muted:  rgba(226, 232, 240, 0.20);
+  /* Gelap (bawaan) */
+  --bg: #161616; --panel: #1F1F1F; --control: #2B2B2B;
+  --control-hover: #353535; --control-pressed: #404040;
+  --separator: #333333; --border: #808080;
+  --text: #EDEDED; --text-2: #B9B9B9; --text-3: #A0A0A0; --focus: #EDEDED;
+  --primary: #EDEDED; --on-primary: #161616; --primary-hover: #FFFFFF; --primary-pressed: #D4D4D4;
+  --st-memantau: #5CC8F2;      /* hanya garis glyph */
+  --st-aman: #4CD27A;          /* hanya garis glyph */
+  --st-peringatan: #F2CB2E;    /* kata, jumlah, isi lajur */
+  --st-pelanggaran: #FF7A70;   /* kata, jumlah, isi lajur */
+  --tint-pelanggaran: #3C1D1E; /* rgba(193,18,28,.18) di atas panel */
+  --alarm-plate-edge: #FF7A70;
+  --lane-track: #2B2B2B; --lane-rule: #A0A0A0; --lane-normal: #8E8E8E;
+  --backdrop: rgba(0,0,0,0.88);
 }
-
-/* ─── Reset & Base ──────────────────────────────── */
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-html, body, #root {
-  height: 100%;
-  overflow: hidden;
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #EBEBEB; --panel: #FFFFFF; --control: #F3F3F3;
+    --control-hover: #E8E8E8; --control-pressed: #DCDCDC;
+    --separator: #D4D4D4; --border: #808080;
+    --text: #161616; --text-2: #474747; --text-3: #5C5C5C; --focus: #161616;
+    --primary: #161616; --on-primary: #FFFFFF; --primary-hover: #2E2E2E; --primary-pressed: #3D3D3D;
+    --st-memantau: #04679A; --st-aman: #17773A;
+    --st-peringatan: #765A00; --st-pelanggaran: #B0101A;
+    --tint-pelanggaran: #F9E7E8;  /* rgba(193,18,28,.10) di atas putih */
+    --alarm-plate-edge: #C1121C;
+    --lane-track: #DCDCDC; --lane-rule: #5C5C5C; --lane-normal: #6B6B6B;
+    --backdrop: rgba(22,22,22,0.72);
+  }
 }
-
-body {
-  background-color: var(--void);
-  color: var(--text);
-  font-family: 'DM Sans', sans-serif;
-  -webkit-font-smoothing: antialiased;
+@media (prefers-contrast: more) {
+  :root { --separator: #808080; --text-2: #D0D0D0; --text-3: #B9B9B9; --border: #B9B9B9;
+          --lane-rule: #EDEDED; --tint-pelanggaran: #4C1B1E; }
 }
-
-/* ─── Glass card mixin ──────────────────────────── */
-.glass {
-  background: var(--card);
-  border: 1px solid var(--edge);
-  backdrop-filter: blur(16px);
-}
-
-/* ─── Glow utilities — lebih subtle ────────────── */
-.glow-cyan  { text-shadow: 0 0 24px rgba(34, 211, 238, 0.4); }
-
-/* ─── Custom scrollbar ──────────────────────────── */
-.scroll-thin {
-  scrollbar-width: thin;
-  scrollbar-color: rgba(255,255,255,0.08) transparent;
-}
-.scroll-thin::-webkit-scrollbar        { width: 3px; }
-.scroll-thin::-webkit-scrollbar-track  { background: transparent; }
-.scroll-thin::-webkit-scrollbar-thumb  { background: rgba(255,255,255,0.08); border-radius: 99px; }
-.scroll-thin::-webkit-scrollbar-thumb:hover { background: rgba(34,211,238,0.25); }
-
-/* ─── Live dot pulse ────────────────────────────── */
-.live-dot {
-  animation: livePulse 2s ease-in-out infinite;
-}
-@keyframes livePulse {
-  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(34,211,238,0.5); }
-  50%       { opacity: 0.6; box-shadow: 0 0 0 6px rgba(34,211,238,0); }
+@media (prefers-contrast: more) and (prefers-color-scheme: light) {
+  :root { --separator: #808080; --text-2: #2E2E2E; --text-3: #474747; --border: #474747;
+          --lane-rule: #161616; --tint-pelanggaran: #F5D9DB; }
 }
 
-/* ─── Scanline sweep (lebih subtle) ─────────────── */
-.scanline-wrap { position: relative; overflow: hidden; }
-.scanline-wrap::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  top: auto;
-  left: 0;
-  width: 100%;
-  height: 80px;
-  background: linear-gradient(
-    to bottom,
-    transparent 0%,
-    rgba(34, 211, 238, 0.018) 50%,
-    transparent 100%
-  );
-  animation: scanSweep 9s linear infinite;
-  pointer-events: none;
-  z-index: 6;
-}
-@keyframes scanSweep {
-  0%   { transform: translateY(-100vh); }
-  100% { transform: translateY(200vh); }
+/* ─── Dasar ─────────────────────────────────────── */
+@layer base {
+  /* Tanpa overflow: hidden, supaya zoom 200 % dan layar sempit bisa digulir */
+  html, body, #root { min-height: 100%; }
+  body { background: var(--bg); color: var(--text); font: 400 14px/20px var(--font-ui); }
+  :focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 }
 
-/* ─── Alert card entrance ───────────────────────── */
-/* fill-mode `both`: kartu transparan selama delay, lalu bertahan di opacity 1.
-   Jangan pasang `opacity: 0` statis di sini — begitu animasinya tertimpa
-   kelas lain, kartu jadi tidak terlihat selamanya. */
-.alert-enter {
-  animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1) both;
-}
-@keyframes slideUp {
-  from { opacity: 0; transform: translateY(10px); }
-  to   { opacity: 1; transform: translateY(0); }
+@layer utilities {
+  /* Angka bergaya rambu dengan lebar digit tetap (durasi, jam, jumlah) */
+  .num { font-family: var(--font-num); font-variant-numeric: tabular-nums; }
+  .tnum { font-variant-numeric: tabular-nums; }
+  .scroll-thin { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
 }
 
-/* ─── Stat number entrance ──────────────────────── */
-.stat-enter {
-  animation: fadeScale 0.45s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-  opacity: 0;
-}
-@keyframes fadeScale {
-  from { opacity: 0; transform: scale(0.88); }
-  to   { opacity: 1; transform: scale(1); }
+/* ─── Komponen ──────────────────────────────────── */
+@layer components {
+  /* Tombol. Tanpa ikon di dalam tombol. */
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    height: 36px; padding: 0 14px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--control); color: var(--text);
+    font: 600 14px/20px var(--font-ui); white-space: nowrap; cursor: pointer; user-select: none;
+  }
+  .btn:hover:not(:disabled):not([aria-disabled="true"])  { background: var(--control-hover); }
+  .btn:active:not(:disabled):not([aria-disabled="true"]) { background: var(--control-pressed); }
+  .btn-sm { height: 32px; padding: 0 12px; font-size: 13px; line-height: 18px; }
+  .btn-primary {
+    height: 44px; padding: 0 18px; font-size: 15px;
+    border-color: transparent; background: var(--primary); color: var(--on-primary);
+  }
+  .btn-primary:hover:not(:disabled)  { background: var(--primary-hover); }
+  .btn-primary:active:not(:disabled) { background: var(--primary-pressed); }
+  /* Tombol utama kecil (mis. "Coba lagi" di catatan gagal ambil frame) */
+  .btn-primary.btn-sm { height: 32px; padding: 0 12px; font-size: 13px; line-height: 18px; }
+  .btn:disabled,
+  .btn[aria-disabled="true"] {
+    background: transparent; border-color: var(--separator); color: var(--text-3); cursor: not-allowed;
+  }
+  /* Alasan tombol nonaktif, selalu tepat di bawah tombol utama */
+  .reason { font: 400 13px/18px var(--font-ui); color: var(--text-2); }
+
+  /* Catatan (galat, info, berhasil): selalu netral, tidak pernah merah */
+  .note {
+    display: grid; grid-template-columns: 16px minmax(0, 1fr); gap: 8px;
+    padding: 10px 12px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--control); color: var(--text);
+    font: 400 13px/18px var(--font-ui);
+  }
+  .note > svg { margin-top: 1px; }
+  .note > :only-child { grid-column: 1 / -1; }
+  .note strong { font-weight: 600; }
+  .note p + p { margin-top: 4px; }
+  .note-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .note-frame { max-width: 420px; background: var(--panel); }
+
+  /* Pelat */
+  .plate-alarm {
+    display: inline-flex; align-items: center; height: 28px; padding: 0 10px; border-radius: 2px;
+    background: var(--sign-red); color: #FFFFFF; border: 1px solid var(--alarm-plate-edge);
+    font: 700 15px/20px var(--font-sign); font-variant-numeric: tabular-nums; white-space: nowrap; flex: none;
+  }
+  .plate-fault {
+    display: inline-flex; align-items: center; gap: 8px; height: 28px; padding: 0 10px; border-radius: 2px;
+    background: var(--text); color: var(--panel); font: 600 14px/20px var(--font-ui); white-space: nowrap; flex: none;
+  }
+  /* Label di atas video / kanvas (tanpa blur) */
+  .plate-video {
+    background: rgba(0,0,0,.88); border: 1px solid var(--well-line); color: #EDEDED; border-radius: 4px;
+    padding: 8px 12px; font: 400 14px/20px var(--font-ui); pointer-events: none;
+  }
+  .plate-readout {
+    padding: 4px 8px; font: 600 12px/16px var(--font-num); font-variant-numeric: tabular-nums; white-space: pre;
+  }
+
+  .rambu, .glyph { flex: none; }
+
+  /* ── Header dashboard (48 px) ── */
+  .app-header {
+    display: flex; align-items: center; gap: 20px; height: 48px; padding: 0 16px; min-width: 0;
+    background: var(--bg); border-bottom: 1px solid var(--separator);
+  }
+  /* Rambu + "Parking Guard" (juga dipakai di bar wizard) */
+  .brand {
+    display: flex; align-items: center; gap: 8px; flex: none; white-space: nowrap;
+    font: 700 16px/20px var(--font-sign); color: var(--text);
+  }
+  .sys-status {
+    display: flex; align-items: center; gap: 8px; min-width: 0; white-space: nowrap;
+    font: 400 14px/20px var(--font-ui); color: var(--text-2);
+  }
+  .sys-status-hint { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-size: 13px; line-height: 18px; color: var(--text-2); }
+  .app-header-spacer { flex: 1 1 auto; }
+  .app-header-divider { flex: none; width: 1px; height: 24px; background: var(--separator); }
+  .clock { display: flex; align-items: baseline; gap: 12px; flex: none; white-space: nowrap; contain: layout paint; }
+  .clock-date { display: none; font: 400 13px/18px var(--font-ui); color: var(--text-2); }
+  .clock-time { font: 600 18px/24px var(--font-num); font-variant-numeric: tabular-nums; color: var(--text); }
+
+  /* ── Tata letak dashboard ── */
+  .dash { height: 100vh; min-height: 600px; display: grid; grid-template-rows: 48px minmax(0, 1fr); }
+  .dash-body {
+    display: grid; grid-template-columns: minmax(0, 1fr) clamp(400px, 28vw, 480px);
+    gap: 16px; padding: 16px; min-height: 0;
+  }
+
+  /* ── Kolom video ── */
+  .video-col { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+  .video-toolbar { flex: none; display: flex; align-items: center; gap: 24px; height: 40px; min-width: 0; }
+  .video-toolbar-end { margin-left: auto; }
+  /* Pasangan label + nilai: "Sumber input4.mp4", "Zona Seluruh frame" */
+  .meta { display: inline-flex; align-items: baseline; gap: 8px; min-width: 0; }
+  .meta-label { flex: none; font: 400 12px/16px var(--font-ui); color: var(--text-3); }
+  .meta-value {
+    min-width: 0; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font: 600 14px/20px var(--font-ui); color: var(--text);
+  }
+  .well {
+    flex: 1; min-height: 0; position: relative; contain: layout paint;
+    background: var(--well); border-radius: 4px 4px 0 0;
+  }
+  /* Pesan di atas hitam (video belum tersambung, frame editor dimuat) */
+  .well-msg {
+    position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 4px; padding: 24px; text-align: center; font: 400 12px/16px var(--font-ui); color: var(--on-well-2);
+  }
+  .well-msg-title { font: 600 14px/20px var(--font-ui); color: var(--on-well); }
+  /* Strip legenda di bawah video; kotak sendiri supaya repaint MJPEG tidak ikut mengecatnya */
+  .bezel {
+    flex: none; min-height: 32px; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+    gap: 6px 20px; padding: 6px 12px; background: var(--well); border-radius: 0 0 4px 4px;
+    font: 400 12px/16px var(--font-ui); color: var(--on-well); contain: layout paint;
+  }
+  .legend { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 16px; }
+  .legend-item { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .legend-swatch { flex: none; width: 14px; height: 10px; border: 2px solid var(--cv-zone); }
+  .legend-swatch.sw-zona        { border-color: var(--cv-zone); }
+  .legend-swatch.sw-memantau    { border-color: var(--cv-memantau); }
+  .legend-swatch.sw-peringatan  { border-color: var(--cv-peringatan); }
+  .legend-swatch.sw-aman        { border-color: var(--cv-aman); }
+  .legend-swatch.sw-pelanggaran { border-color: var(--cv-pelanggaran); }
+  .legend-swatch.sw-luar        { border-color: var(--cv-luar); border-style: dashed; }
+  /* Kata Inggris yang dibakar di frame, hanya di layar >= 1440 px */
+  .legend-en { display: none; color: var(--on-well-2); }
+  .bezel-meta { display: flex; align-items: center; gap: 12px; white-space: nowrap; }
+  .bezel-dim { color: var(--on-well-2); }
+
+  /* ── Daftar kendaraan ── */
+  .vlist {
+    /* Kolom dipakai bersama kepala kolom dan semua baris, supaya garis 1 mnt / 5 mnt
+       menyambung lurus. Kolom durasi sengaja tetap (bukan auto): lebar auto berbeda
+       per baris dan menggeser lajur. */
+    --vrow-cols: 20px minmax(0, 1fr) 120px 64px;
+    display: flex; flex-direction: column; min-height: 0; overflow: hidden;
+    background: var(--panel); border: 1px solid var(--separator); border-radius: 8px;
+  }
+  .vlist-head { flex: none; padding: 12px 16px 10px; border-bottom: 1px solid var(--separator); }
+  .vlist-title-row { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  .vlist-title { font: 600 15px/20px var(--font-ui); color: var(--text); }
+  .vlist-total { font: 600 15px/20px var(--font-num); font-variant-numeric: tabular-nums; color: var(--text-2); }
+  .vlist-summary { margin-top: 2px; font: 400 13px/18px var(--font-ui); color: var(--text-2); }
+  .vlist-summary-alarm { font-weight: 600; color: var(--st-pelanggaran); }
+  .vlist-stale { margin-left: 8px; font: 400 12px/16px var(--font-ui); color: var(--text-3); }
+  .vlist-stale:first-child { margin-left: 0; }
+
+  /* Kepala kolom. Gutter scrollbar dipesan sama dengan .vlist-body supaya kolom sejajar. */
+  .vlist-cols {
+    flex: none; display: grid; grid-template-columns: var(--vrow-cols); column-gap: 12px; align-items: center;
+    height: 28px; padding: 0 16px; border-bottom: 1px solid var(--separator);
+    font: 600 12px/16px var(--font-ui); color: var(--text-2);
+    overflow: hidden; scrollbar-gutter: stable; scrollbar-width: thin;
+  }
+  .vlist-cols-status { grid-column: 1 / span 2; }
+  .vlist-cols-lane { grid-column: 3; position: relative; height: 16px; }
+  .vlist-cols-lane > span { position: absolute; top: 0; transform: translateX(-50%); white-space: nowrap; }
+  .vlist-cols-lane > .at-1 { left: 16.6667%; }
+  .vlist-cols-lane > .at-5 { left: 83.3333%; }
+  .vlist-cols-dur { grid-column: 4; text-align: right; }
+
+  .vlist-body {
+    flex: 1; min-height: 0; overflow-y: auto; contain: layout paint;
+    scrollbar-gutter: stable; scrollbar-width: thin; scrollbar-color: var(--border) transparent;
+  }
+  .vlist-empty { flex: 1; min-height: 0; overflow-y: auto; padding: 24px 16px; }
+  .vlist-empty-title { font: 600 15px/20px var(--font-ui); color: var(--text); }
+  .vlist-empty-text { margin-top: 4px; font: 400 13px/18px var(--font-ui); color: var(--text-2); }
+  .vlist-empty .rule-lane { margin-top: 24px; }
+
+  /* Baris: [glyph][status][lajur][durasi] / [ ][kendaraan][lajur][durasi] */
+  .vrow {
+    position: relative; display: grid; grid-template-columns: var(--vrow-cols); grid-template-rows: auto auto;
+    column-gap: 12px; row-gap: 2px; align-items: center; min-height: 56px; padding: 8px 16px;
+    border-top: 1px solid var(--separator); contain: layout;
+  }
+  .vrow:first-child { border-top: 0; }
+  .vrow > * { position: relative; z-index: 1; }
+  /* Harus setelah `.vrow > *` supaya position/z-index ini yang menang */
+  .vrow-tint { position: absolute; inset: 0; z-index: 0; background: var(--tint-pelanggaran); }
+  .tint-in { animation: tintIn 200ms ease-out both; }
+  .vrow-glyph { grid-column: 1; grid-row: 1; display: flex; align-items: center; justify-content: center; height: 20px; }
+  .vrow-status { grid-column: 2; grid-row: 1; display: flex; align-items: baseline; min-width: 0; overflow: hidden; white-space: nowrap; }
+  .vrow-word { font: 600 15px/20px var(--font-sign); color: var(--text-2); }
+  .vrow-lid { margin-left: 10px; font: 400 13px/18px var(--font-ui); font-variant-numeric: tabular-nums; color: var(--text-2); }
+  .vrow-meta { grid-column: 2; grid-row: 2; display: flex; align-items: baseline; min-width: 0; white-space: nowrap; }
+  .vrow-vehicle { min-width: 0; overflow: hidden; text-overflow: ellipsis; font: 400 14px/20px var(--font-ui); color: var(--text); }
+  .vrow-zone { flex: none; margin-left: 8px; font: 400 13px/18px var(--font-ui); color: var(--text-2); }
+  /* justify-self:end: angka yang lebih lebar dari kolom meluber ke kiri (ke celah), bukan menggeser lajur */
+  .vrow-dur {
+    grid-column: 4; grid-row: 1 / span 2; justify-self: end; white-space: nowrap;
+    font: 600 24px/28px var(--font-num); font-variant-numeric: tabular-nums; color: var(--text);
+  }
+  .vrow-dur.is-long { font-size: 20px; }   /* h:mm:ss, durasi >= 1 jam */
+
+  /* Lajur waktu 0–6 menit. Margin negatif menutupi padding + garis pemisah baris,
+     jadi garis 1 mnt / 5 mnt terbaca menyambung dari baris ke baris. */
+  .lane { grid-column: 3; grid-row: 1 / span 2; align-self: stretch; position: relative; margin: -9px 0 -8px; }
+  .lane-track, .lane-fill { position: absolute; left: 0; top: 50%; height: 6px; margin-top: -3px; }
+  .lane-track { right: 0; background: var(--lane-track); }
+  .lane-rule  { position: absolute; top: 0; bottom: 0; background: var(--lane-rule); }
+  .lane-rule.r1 { left: calc(16.6667% - .5px); width: 1px; }   /* 60/360 */
+  .lane-rule.r5 { left: calc(83.3333% - 1px);  width: 2px; }   /* 300/360 */
+  .lane-fill  { z-index: 2; background: var(--lane-normal); }  /* di atas garis; garis tetap terlihat di atas dan bawah bar */
+  .lane-cap   { position: absolute; right: -4px; top: 50%; width: 2px; height: 12px; margin-top: -6px; z-index: 2; background: var(--lane-normal); }
+
+  /* Per status */
+  .vrow.is-warning .vrow-word { color: var(--st-peringatan); }
+  .vrow.is-violation .vrow-word { color: var(--st-pelanggaran); font-weight: 700; }
+  .vrow.is-warning .lane-fill, .vrow.is-warning .lane-cap { background: var(--st-peringatan); }
+  .vrow.is-violation .lane-fill, .vrow.is-violation .lane-cap { background: var(--st-pelanggaran); }
+  .vrow.is-safe .vrow-vehicle, .vrow.is-safe .vrow-dur { color: var(--text-2); }
+
+  /* Data basi (WebSocket putus): semua netral, tanpa opacity */
+  .is-stale .vrow .vrow-word { color: var(--text-2); }
+  .is-stale .vrow .lane-fill, .is-stale .vrow .lane-cap { background: var(--lane-normal); }
+  .is-stale .vrow-tint { display: none; }
+  .is-stale .vlist-summary-alarm { color: var(--text-2); }
+
+  /* ── RuleLane (aturan waktu) ── */
+  .rule-lane { max-width: 480px; }
+  .rule-lane-scale { position: relative; height: 16px; font-size: 12px; line-height: 16px; color: var(--text-2); }
+  .rule-lane-scale > span { position: absolute; top: 0; white-space: nowrap; }
+  .rule-lane-scale > .at-0 { left: 0; }
+  .rule-lane-scale > .at-1 { left: 16.6667%; transform: translateX(-50%); }
+  .rule-lane-scale > .at-5 { left: 83.3333%; transform: translateX(-50%); }
+  .rule-lane-scale > .at-6 { right: 0; }
+  .rule-lane-bar { position: relative; height: 16px; margin-top: 4px; }
+  .rule-lane-seg { position: absolute; top: 50%; height: 6px; margin-top: -3px; z-index: 2; }
+  .rule-lane-seg.seg-normal { left: 0; width: 16.6667%; background: var(--lane-normal); }
+  .rule-lane-seg.seg-warn   { left: 16.6667%; width: 66.6666%; background: var(--st-peringatan); }
+  .rule-lane-seg.seg-viol   { left: 83.3333%; right: 0; background: var(--st-pelanggaran); }
+  .rule-lane-dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); column-gap: 16px; margin-top: 12px; }
+  .rule-lane-dl > dt {
+    display: flex; align-items: center; gap: 8px; min-height: 28px;
+    font: 600 13px/18px var(--font-ui); color: var(--text);
+  }
+  .rule-lane-dl > dd { display: flex; align-items: center; min-height: 28px; font: 400 13px/18px var(--font-ui); color: var(--text-2); }
+
+  /* ── Wizard ── */
+  .wizard-shell { min-height: 100vh; background: var(--bg); }
+  .wizard-bar {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    height: 56px; padding: 0 16px; border-bottom: 1px solid var(--separator);
+  }
+  .stepper { display: flex; align-items: center; gap: 24px; font: 400 13px/18px var(--font-ui); color: var(--text-3); }
+  .stepper > li { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+  .stepper > li.is-done { color: var(--text-2); }
+  /* block, bukan flex: garis bawah harus jatuh di teks langkah */
+  .stepper > li[aria-current="step"] {
+    display: block; color: var(--text); font-weight: 600;
+    text-decoration: underline 2px; text-underline-offset: 6px;
+  }
+  .wizard-col { max-width: 560px; margin: 12vh auto 48px; padding: 0 16px; }
+  .wizard-title { font: 700 24px/30px var(--font-sign); color: var(--text); }
+  .wizard-lead { margin-top: 6px; font: 400 15px/22px var(--font-ui); color: var(--text-2); }
+  .wizard-group { margin-top: 24px; }
+  .wizard-actions { display: flex; align-items: center; gap: 12px; }
+  .wizard-actions > .btn-primary { flex: 1; }
+  .block-title { font: 600 15px/20px var(--font-ui); color: var(--text); }
+  .field-label { display: block; font: 600 13px/18px var(--font-ui); color: var(--text); }
+  .help { font: 400 13px/18px var(--font-ui); color: var(--text-2); }
+
+  /* Baris opsi = <label class="opt"><input type="radio"> ... </label> di dalam <fieldset> */
+  .opt-list { display: grid; gap: 12px; min-width: 0; }
+  .opt {
+    display: grid; grid-template-columns: 18px minmax(0, 1fr); column-gap: 12px; align-items: start;
+    min-height: 64px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 8px;
+    background: var(--panel); color: var(--text); cursor: pointer;
+  }
+  .opt:hover { background: var(--control); }
+  .opt:has(input:checked) { border-color: var(--text); box-shadow: inset 0 0 0 1px var(--text); }
+  .opt:has(input:focus-visible) { outline: 2px solid var(--focus); outline-offset: 2px; }
+  .opt:has(input:disabled) { cursor: not-allowed; color: var(--text-3); }
+  .opt > input { width: 18px; height: 18px; margin: 1px 0 0; accent-color: var(--text); }
+  .opt > input:focus-visible { outline: none; }   /* cincin fokus dipindah ke baris */
+  .opt-title { font: 600 15px/20px var(--font-ui); }
+  .opt-tag { margin-left: 8px; font: 400 12px/16px var(--font-ui); color: var(--text-2); }
+  .opt-desc { display: block; margin-top: 2px; font: 400 13px/18px var(--font-ui); color: var(--text-2); }
+
+  /* Indeks kamera: radiogroup bersambung, radio asli disembunyikan (sr-only) */
+  .seg { display: inline-flex; }
+  .seg > label {
+    position: relative; display: inline-flex; align-items: center; justify-content: center;
+    width: 44px; height: 36px; margin-left: -1px; border: 1px solid var(--border);
+    background: var(--control); color: var(--text); font: 600 14px/20px var(--font-ui);
+    font-variant-numeric: tabular-nums; cursor: pointer;
+  }
+  .seg > label:first-child { margin-left: 0; border-radius: 6px 0 0 6px; }
+  .seg > label:last-child { border-radius: 0 6px 6px 0; }
+  .seg > label:hover { background: var(--control-hover); }
+  .seg > label:has(input:checked) { z-index: 1; background: var(--text); border-color: var(--text); color: var(--panel); }
+  .seg > label:has(input:focus-visible) { z-index: 2; outline: 2px solid var(--focus); outline-offset: 2px; }
+
+  /* Unggah file */
+  .dropzone {
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;
+    min-height: 112px; padding: 16px; border: 1.5px dashed var(--border); border-radius: 8px; text-align: center;
+  }
+  .dropzone.is-over { border: 2px solid var(--text); background: var(--control); }
+  .dropzone-line {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px;
+    font: 400 14px/20px var(--font-ui); color: var(--text-2);
+  }
+  .dropzone-caption { font: 400 12px/16px var(--font-ui); color: var(--text-3); }
+  .file-row {
+    display: flex; align-items: center; gap: 12px; padding: 12px 16px;
+    background: var(--panel); border: 1px solid var(--separator); border-radius: 8px;
+  }
+  .file-row-name {
+    flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font: 600 14px/20px var(--font-ui); color: var(--text);
+  }
+  .file-row-size { flex: none; font: 400 13px/18px var(--font-ui); font-variant-numeric: tabular-nums; color: var(--text-2); }
+  .check-row {
+    display: grid; grid-template-columns: 18px minmax(0, 1fr); column-gap: 12px; align-items: start;
+    min-height: 48px; padding: 4px 0; cursor: pointer;
+  }
+  .check-row > input { width: 18px; height: 18px; margin: 1px 0 0; accent-color: var(--text); }
+  .check-row-title { display: block; font: 600 14px/20px var(--font-ui); color: var(--text); overflow-wrap: anywhere; }
+  .check-row-help { display: block; margin-top: 2px; font: 400 13px/18px var(--font-ui); color: var(--text-2); }
+  .upload { display: grid; gap: 8px; }
+  .upload-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  .upload-name {
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font: 600 14px/20px var(--font-ui); color: var(--text);
+  }
+  .upload-size { flex: none; font: 400 13px/18px var(--font-ui); font-variant-numeric: tabular-nums; color: var(--text-2); }
+  .progress { height: 4px; overflow: hidden; background: var(--separator); }
+  .progress-fill { height: 100%; background: var(--text); }   /* lebar diset per event, tanpa transisi */
+
+  /* ── Editor zona (wizard langkah 2b dan dialog berbagi isi) ── */
+  .editor-page { height: 100vh; display: grid; grid-template-rows: 48px minmax(0, 1fr); background: var(--bg); }
+  .editor-page > .wizard-bar { height: 48px; }
+  .editor-body {
+    display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px; padding: 16px; min-height: 0;
+  }
+  /* Pembungkus hitam ZoneEditor: tidak menambah border/padding ke ZoneEditor */
+  .editor-stage {
+    position: relative; min-width: 0; min-height: 0; overflow: hidden; contain: layout paint;
+    background: #000; border-radius: 4px;
+  }
+  .editor-side {
+    display: flex; flex-direction: column; min-height: 0; padding: 16px;
+    background: var(--panel); border-left: 1px solid var(--separator);
+  }
+  .editor-side-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; }
+  .editor-actions {
+    flex: none; display: flex; flex-direction: column; gap: 8px;
+    margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--separator);
+  }
+  .side-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+  .side-title { font: 700 18px/24px var(--font-sign); color: var(--text); }
+  .steps { list-style: decimal; padding-left: 20px; display: grid; gap: 4px; font: 400 13px/18px var(--font-ui); color: var(--text-2); }
+  .side-note { font: 400 12px/16px var(--font-ui); color: var(--text-2); }
+  .side-note-dim { font: 400 12px/16px var(--font-ui); color: var(--text-3); }
+  .zone-list-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding-bottom: 4px; }
+  .zone-list-title { font: 600 15px/20px var(--font-ui); color: var(--text); }
+  .zone-list-count { font: 400 12px/16px var(--font-ui); font-variant-numeric: tabular-nums; color: var(--text-3); }
+  .zone-row {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    min-height: 36px; border-top: 1px solid var(--separator);
+  }
+  .zone-row-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 600 14px/20px var(--font-ui); color: var(--text); }
+  .zone-row.is-draft .zone-row-name { font-weight: 400; }
+  .zone-row-count { flex: none; font: 400 13px/18px var(--font-ui); font-variant-numeric: tabular-nums; color: var(--text-2); }
+  .zone-empty { padding-top: 8px; border-top: 1px solid var(--separator); font: 400 13px/18px var(--font-ui); color: var(--text-2); }
+  .btn-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  /* Baris sebaris "Semua zona dihapus. [Urungkan]" */
+  .inline-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; font: 400 13px/18px var(--font-ui); color: var(--text-2); }
+  .confirm-title { font: 600 14px/20px var(--font-ui); color: var(--text); }
+
+  /* Bagian ZoneEditor (matematika tidak berubah, hanya gaya) */
+  .zone-box { position: relative; }
+  .zone-box:focus { outline: none; }
+  /* Cincin fokus digambar di ::after supaya tetap di atas kanvas (z-index 10)
+     dan di bawah kaca pembesar (z-index 20) */
+  .zone-box:focus-visible::after {
+    content: ""; position: absolute; inset: 0; z-index: 18; pointer-events: none;
+    outline: 2px solid #FFFFFF; outline-offset: -4px; box-shadow: inset 0 0 0 4px #000000;
+  }
+  .loupe { border-radius: 4px; border: 1px solid #808080; }
+  /* Bidik keyboard 11×11: garis putih 1 px bertepi hitam 1 px */
+  .kb-cross { position: absolute; width: 11px; height: 11px; margin: -5px 0 0 -5px; z-index: 19; pointer-events: none; }
+  .kb-cross::before, .kb-cross::after { content: ""; position: absolute; background: #FFFFFF; outline: 1px solid #000000; }
+  .kb-cross::before { left: 0; right: 0; top: 5px; height: 1px; }
+  .kb-cross::after  { top: 0; bottom: 0; left: 5px; width: 1px; }
+
+  /* ── Dialog "Ubah zona" (<dialog> asli, showModal) ── */
+  .zone-dialog {
+    width: min(96vw, 1500px); height: 94vh; max-width: none; max-height: none; margin: auto; padding: 12px;
+    background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 10px;
+    grid-template-columns: minmax(0, 1fr) 300px; grid-template-rows: minmax(0, 1fr); gap: 12px;
+  }
+  /* display:grid hanya saat [open]: kalau dipasang di kelas dasar, dialog yang
+     belum showModal() ikut tampil karena menimpa display:none bawaan browser */
+  .zone-dialog[open] { display: grid; animation: dlgIn 150ms ease-out both; }
+  .zone-dialog::backdrop { background: var(--backdrop); }
+
+  /* ── Lebar >= 1440 px ── */
+  @media (min-width: 1440px) {
+    .clock-date { display: inline; }
+    .legend-en { display: inline; }
+  }
+
+  /* ── Di bawah 1100 px (termasuk zoom 200 %): satu kolom, halaman digulir ── */
+  @media (max-width: 1099px) {
+    .dash { height: auto; grid-template-rows: auto auto; }
+    .dash-body { grid-template-columns: 1fr; }
+    .well { aspect-ratio: 16/9; flex: none; }
+    .vlist { max-height: none; }
+    .vlist-body, .vlist-cols, .vlist-empty { overflow: visible; }
+
+    /* Header dua baris: brand (+ pelat) dan jam di baris 1, status dan tombol di baris 2 */
+    .app-header { height: auto; min-height: 48px; flex-wrap: wrap; column-gap: 16px; row-gap: 4px; padding: 8px 16px; }
+    .app-header > * { order: 3; }
+    .app-header > .brand, .app-header > .plate-alarm { order: 0; }
+    .app-header > .clock { order: 1; margin-left: auto; }
+    .app-header > .app-header-spacer { order: 2; flex-basis: 100%; height: 0; }
+    .app-header > .app-header-divider { display: none; }
+
+    .video-toolbar { height: auto; min-height: 40px; flex-wrap: wrap; row-gap: 4px; }
+
+    .editor-page { height: auto; min-height: 100vh; grid-template-rows: 48px auto; }
+    .editor-body { grid-template-columns: 1fr; }
+    .editor-stage { min-height: 360px; }
+    .editor-side { border-left: 0; border-top: 1px solid var(--separator); }
+    .editor-side-scroll { overflow: visible; }
+    .zone-dialog[open] { grid-template-columns: 1fr; grid-template-rows: auto auto; }
+  }
 }
 
-/* ─── Violation card pulsing ────────────────────── */
-.violation-pulse {
-  animation: violationGlow 2.5s ease-in-out infinite;
-}
-/* Kartu pelanggaran memakai dua kelas sekaligus. Shorthand `animation` saling
-   menimpa, jadi animasi masuk dan glow harus ditulis dalam satu daftar. */
-.alert-enter.violation-pulse {
-  animation:
-    slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1) both,
-    violationGlow 2.5s ease-in-out infinite;
-}
-@keyframes violationGlow {
-  0%, 100% { box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.25); }
-  50%       { box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.6), 0 0 20px rgba(248, 113, 113, 0.12); }
+/* ─── Animasi (hanya dua, sekali jalan) ─────────── */
+@keyframes tintIn { from { opacity: 0 } to { opacity: 1 } }
+@keyframes dlgIn  { from { opacity: 0 } to { opacity: 1 } }
+
+/* ─── Mode kontras paksa (Windows High Contrast) ── */
+@media (forced-colors: active) {
+  .btn, .opt, .plate-fault, .vlist { border: 1px solid CanvasText; }
+  .btn:disabled, .btn[aria-disabled="true"] { border-color: GrayText; color: GrayText; }
+  .rambu, .glyph, .plate-alarm, .lane-fill { forced-color-adjust: none; }
+  /* Tambahan: bagian lajur dan swatch legenda adalah warna latar, yang di mode
+     ini dipaksa jadi Canvas; tanpa ini lajur dan legenda hilang */
+  .lane-track, .lane-rule, .lane-cap, .rule-lane-seg, .legend-swatch { forced-color-adjust: none; }
+  .opt:has(input:checked) { border: 2px solid Highlight; padding: 13px 15px; }
+  .seg > label:has(input:checked) { forced-color-adjust: none; background: Highlight; border-color: Highlight; color: HighlightText; }
+  .progress { border: 1px solid CanvasText; }
+  .progress-fill { forced-color-adjust: none; background: Highlight; }
 }
 
-/* ─── Wizard step animations ────────────────────── */
-.wizard-enter {
-  animation: wizardIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-  opacity: 0;
+/* ─── Mode ringan (?lite di URL, lihat main.jsx) ── */
+/* Untuk PC tanpa akselerasi GPU: browser menggambar setiap frame dengan CPU
+   (terukur di mini PC i5-2400S: animasi + blur memakan ~70% satu core di
+   proses GPU Chrome dan memperlambat tick deteksi). Tampilannya sama dengan
+   mode biasa; di sini semua gerakan dinolkan. Durasi dibuat 0 (BUKAN
+   `animation: none`) supaya elemen yang animasinya berakhir di opacity 1
+   tetap terlihat. */
+.lite *, .lite *::before, .lite *::after {
+  animation-duration: 0s !important;
+  animation-delay: 0s !important;
+  transition: none !important;
 }
-@keyframes wizardIn {
-  from { opacity: 0; transform: translateY(16px) scale(0.98); }
-  to   { opacity: 1; transform: translateY(0) scale(1); }
-}
-
-/* ─── Fade in ───────────────────────────────────── */
-.fade-in {
-  animation: fadeIn 0.5s ease forwards;
-}
-@keyframes fadeIn {
-  from { opacity: 0; }
-  to   { opacity: 1; }
+/* Sama untuk pengguna yang meminta gerak dikurangi di pengaturan sistem */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0s !important;
+    animation-delay: 0s !important;
+    transition: none !important;
+  }
 }

@@ -1,271 +1,485 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { API_BASE } from '../config'
 import { useFirstFrame } from '../hooks/useFirstFrame'
-import { getImageRect, clientToNormalized, normalizedToCanvas } from '../lib/roiGeometry'
+import ZoneEditor from './ZoneEditor'
+import Icon from './Icon'
+import { Rambu, FaultGlyph } from './Glyphs'
+import RuleLane from './RuleLane'
 
-// ─── Step indicator ───────────────────────────────────────────
-function StepDot({ active, done, label }) {
+// Catatan render: mini PC tidak punya akselerasi GPU di browser, jadi wizard
+// ini tanpa animasi, transisi, gradien, bayangan, atau efek kabur. Gaya dari
+// kelas komponen di index.css. Nama kelas ditulis utuh (bukan dirangkai dari
+// variabel) supaya tidak dibuang Tailwind saat build.
+
+const VIDEO_TYPES = ['video/mp4', 'video/avi', 'video/quicktime', 'video/x-matroska', 'video/webm']
+const NO_SERVER = 'Server deteksi tidak merespons. Jalankan server deteksi, lalu coba lagi.'
+
+// Label sumber singkat ("input3.mp4" / "Kamera 0")
+function sourceLabelOf(info) {
+  if (!info) return ''
+  return info.sourceType === 'camera' ? `Kamera ${info.camIndex}` : info.filename
+}
+
+// 627 572 352 byte jadi "598,5" (format Indonesia, satu angka desimal)
+function formatMB(bytes) {
+  return (bytes / 1048576).toLocaleString('id-ID', { maximumFractionDigits: 1 })
+}
+
+// "Awal: pesan." Titik di akhir pesan server dibuang supaya tidak dobel;
+// tanpa pesan cukup "Awal."
+function withMessage(lead, message, next = '') {
+  const m = String(message ?? '').trim().replace(/[.\s]+$/, '')
+  return `${lead}${m ? `: ${m}` : ''}.${next ? ` ${next}` : ''}`
+}
+
+// Galat: catatan netral (tidak pernah merah), tepat di bawah kontrolnya
+function ErrorNote({ className = '', children }) {
   return (
-    <div className="flex flex-col items-center gap-1.5">
-      <div
-        className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold transition-all duration-300"
-        style={{
-          background: done
-            ? 'var(--cyan)'
-            : active
-            ? 'rgba(34,211,238,0.15)'
-            : 'rgba(255,255,255,0.04)',
-          border: `1.5px solid ${done ? 'var(--cyan)' : active ? 'rgba(34,211,238,0.5)' : 'var(--edge)'}`,
-          color: done ? '#08090f' : active ? 'var(--cyan)' : 'var(--text-muted)',
-        }}
-      >
-        {done ? '✓' : ''}
-      </div>
-      <span
-        className="text-[10px] tracking-wide whitespace-nowrap"
-        style={{ color: active ? 'var(--text-dim)' : 'var(--text-muted)' }}
-      >
-        {label}
-      </span>
+    <div className={className ? `note ${className}` : 'note'} role="alert">
+      <FaultGlyph />
+      <p>{children}</p>
     </div>
   )
 }
 
-function StepBar({ step }) {
-  const steps = ['Pilih Sumber', 'Zona Parkir', 'Mulai']
+// ─── Bar atas: rambu (diam) + nama, lalu dua langkah ─────────
+// Menggambar zona termasuk langkah 2, jadi stepper hanya dua item.
+function WizardBar({ step }) {
   return (
-    <div className="flex items-start gap-3">
-      {steps.map((label, i) => (
-        <div key={i} className="flex items-center gap-3">
-          <StepDot active={step === i} done={step > i} label={label} />
-          {i < steps.length - 1 && (
-            <div
-              className="w-12 h-px mb-5 transition-all duration-500"
-              style={{ background: step > i ? 'var(--cyan)' : 'var(--edge)' }}
-            />
-          )}
-        </div>
-      ))}
-    </div>
+    <header className="wizard-bar">
+      <div className="brand"><Rambu />Parking Guard</div>
+      <ol className="stepper" aria-label="Langkah pengaturan">
+        {step === 1 ? (
+          <li aria-current="step">1 Sumber video</li>
+        ) : (
+          <li className="is-done">
+            <Icon name="check" size={14} />
+            1 Sumber video<span className="sr-only">, selesai</span>
+          </li>
+        )}
+        {step === 2 ? <li aria-current="step">2 Zona larangan</li> : <li>2 Zona larangan</li>}
+      </ol>
+    </header>
   )
 }
 
-// ─── Option Card ──────────────────────────────────────────────
-function OptionCard({ selected, onClick, icon, title, desc, badge }) {
-  return (
-    <button
-      onClick={onClick}
-      className="relative w-full text-left p-4 rounded-2xl transition-all duration-200"
-      style={{
-        background: selected ? 'rgba(34,211,238,0.07)' : 'rgba(255,255,255,0.02)',
-        border: `1.5px solid ${selected ? 'rgba(34,211,238,0.45)' : 'var(--edge)'}`,
-        boxShadow: selected ? '0 0 24px rgba(34,211,238,0.06)' : 'none',
-        transform: selected ? 'scale(1.01)' : 'scale(1)',
-      }}
-    >
-      {badge && (
-        <span
-          className="absolute top-3 right-3 text-[9px] font-semibold px-2 py-0.5 rounded-full tracking-wider uppercase"
-          style={{ background: 'var(--purple-soft)', color: 'var(--purple)', border: '1px solid rgba(167,139,250,0.2)' }}
-        >
-          {badge}
-        </span>
-      )}
-      <div className="flex gap-3 items-start">
-        <span className="text-2xl mt-0.5 shrink-0">{icon}</span>
-        <div>
-          <p className="font-semibold text-sm" style={{ color: selected ? 'var(--text)' : 'var(--text-dim)' }}>
-            {title}
-          </p>
-          <p className="text-xs mt-0.5 leading-relaxed" style={{ color: 'var(--text-muted)' }}>
-            {desc}
-          </p>
-        </div>
-      </div>
-      {selected && (
-        <div
-          className="absolute right-4 top-1/2 -translate-y-1/2 w-5 h-5 rounded-full flex items-center justify-center text-xs font-bold"
-          style={{ background: 'var(--cyan)', color: '#08090f' }}
-        >
-          ✓
-        </div>
-      )}
-    </button>
-  )
+// ─── Sidik video: SHA-256 atas tiga potongan 1 MiB ───────────
+// (awal, tengah, akhir; file ≤ 3 MiB di-hash utuh). Rumusnya harus sama
+// dengan video_sample() di backend/main.py. crypto.subtle hanya ada di
+// konteks aman (http://localhost ya, alamat IP LAN tidak); tanpa itu
+// pemeriksaan dilewati dan video langsung diunggah.
+const SAMPLE_BYTES = 1024 * 1024
+
+async function videoSample(file) {
+  if (!globalThis.crypto?.subtle) return null
+  const size = file.size
+  const mid = Math.floor(size / 2) - SAMPLE_BYTES / 2
+  const ranges = size <= 3 * SAMPLE_BYTES
+    ? [[0, size]]
+    : [[0, SAMPLE_BYTES], [mid, mid + SAMPLE_BYTES], [size - SAMPLE_BYTES, size]]
+  const parts = await Promise.all(ranges.map(([a, b]) => file.slice(a, b).arrayBuffer()))
+  const bytes = new Uint8Array(parts.reduce((n, p) => n + p.byteLength, 0))
+  let offset = 0
+  for (const p of parts) { bytes.set(new Uint8Array(p), offset); offset += p.byteLength }
+  const digest = await crypto.subtle.digest('SHA-256', bytes)
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('')
 }
 
-// ─── Step 0: Pilih Sumber Video ───────────────────────────────
-function StepSource({ onNext }) {
-  const [sourceType, setSourceType] = useState(null)
-  const [videoFile, setVideoFile]   = useState(null)
-  const [camIndex,  setCamIndex]    = useState(0)
-  const [uploading, setUploading]   = useState(false)
-  const [error,     setError]       = useState('')
-  const [dragOver,  setDragOver]    = useState(false)
-  const fileRef = useRef(null)
+// ─── GET /upload/check ────────────────────────────────────────
+// Video yang isinya sama sudah ada di server deteksi (mis. dipilih lagi saat
+// ganti sumber): jawaban { path, filename } dipakai langsung tanpa unggah
+// ulang. null = tidak ada, atau pemeriksaan tidak bisa dilakukan / lewat
+// CHECK_TIMEOUT (lalu diunggah seperti biasa). signal = batal oleh user.
+const CHECK_TIMEOUT = 5000
+
+async function findOnServer(file, signal) {
+  const timer = new AbortController()
+  const timeoutId = setTimeout(() => timer.abort(), CHECK_TIMEOUT)
+  const stop = () => timer.abort()
+  signal.addEventListener('abort', stop)
+  try {
+    const sample = await videoSample(file)
+    if (!sample || timer.signal.aborted) return null
+    const res = await fetch(`${API_BASE}/upload/check?size=${file.size}&sample=${sample}`,
+      { cache: 'no-store', signal: timer.signal })
+    const data = await res.json()
+    return data?.status === 'ok' && data.found ? data : null
+  } catch {
+    return null      // gangguan / lewat batas waktu / dibatalkan
+  } finally {
+    clearTimeout(timeoutId)
+    signal.removeEventListener('abort', stop)
+  }
+}
+
+// ─── PUT /upload/stream lewat XHR ────────────────────────────
+// Body = isi file apa adanya (bukan FormData): server menulisnya langsung ke
+// uploads/ tanpa file sementara + salinan kedua. XHR karena fetch belum bisa
+// melaporkan progres unggah. Jawaban bukan JSON (mis. 500 polos) dijadikan
+// galat server, bukan "server tidak merespons".
+function uploadVideo(xhr, file, onProgress) {
+  return new Promise((resolve, reject) => {
+    xhr.open('PUT', `${API_BASE}/upload/stream?filename=${encodeURIComponent(file.name)}`)
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream')
+    xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded, e.total) }
+    xhr.onload = () => {
+      try {
+        resolve(JSON.parse(xhr.responseText))
+      } catch {
+        resolve({ status: 'error', message: `server menjawab HTTP ${xhr.status}` })
+      }
+    }
+    xhr.onerror = () => reject(new Error('network'))
+    xhr.onabort = () => reject(new DOMException('Unggahan dibatalkan', 'AbortError'))
+    xhr.send(file)
+  })
+}
+
+// ─── Langkah 1: sumber video ─────────────────────────────────
+function StepSource({ initial, focusTitle, onNext }) {
+  const [sourceType, setSourceType] = useState(initial?.sourceType ?? null)
+  const [videoFile,  setVideoFile]  = useState(null)
+  const [camIndex,   setCamIndex]   = useState(initial?.sourceType === 'camera' ? initial.camIndex : 0)
+  const [dragOver,   setDragOver]   = useState(false)
+  const [fileError,  setFileError]  = useState('')   // format file salah (di bawah dropzone)
+  const [error,      setError]      = useState('')   // unggah / server (di bawah tombol)
+  const [aborted,    setAborted]    = useState(false)
+  const [uploading,  setUploading]  = useState(false)   // memeriksa atau mengunggah
+  const [checking,   setChecking]   = useState(false)   // GET /upload/check (sebelum unggah)
+  const [progress,   setProgress]   = useState({ loaded: 0, total: 0 })
+  // Video yang sedang dipakai backend (dari GET /status). Bisa dipakai lagi
+  // tanpa upload ulang (di mini PC upload ~600 MB makan waktu).
+  const [activeVideo, setActiveVideo] = useState(null)   // { path, filename }
+  const [useActive,   setUseActive]   = useState(false)
+  const fileRef     = useRef(null)
+  const xhrRef      = useRef(null)
+  const checkRef    = useRef(null)    // AbortController pemeriksaan GET /upload/check
+  const lastPct     = useRef(-1)
+  const titleRef    = useRef(null)
+  const nextRef     = useRef(null)
+  const refocusNext = useRef(false)
+  const changeBtnRef = useRef(null)
+
+  useEffect(() => { if (focusTitle) titleRef.current?.focus() }, [focusTitle])
+
+  // "Pilih file…" hilang bersama dropzone setelah file dipilih; kalau fokus
+  // jatuh ke <body>, pindahkan ke "Ganti file…" yang menggantikan tempatnya
+  useEffect(() => {
+    if (videoFile && document.activeElement === document.body) changeBtnRef.current?.focus()
+  }, [videoFile])
+
+  useEffect(() => {
+    let cancelled = false
+    fetch(`${API_BASE}/status`)
+      .then(res => res.json())
+      .then(data => {
+        const src = data?.source
+        if (cancelled || src?.type !== 'video' || !src.path) return
+        setActiveVideo({ path: src.path, filename: src.path.split(/[\\/]/).pop() })
+      })
+      .catch(() => {})   // backend belum jalan, opsi ini tidak ditampilkan
+    return () => { cancelled = true }
+  }, [])
+
+  // Pemeriksaan / unggahan yang masih berjalan ikut dibatalkan kalau wizard ditutup
+  useEffect(() => () => {
+    checkRef.current?.abort()
+    xhrRef.current?.abort()
+  }, [])
+
+  // Blok unggah menggantikan tombol Lanjut. Setelah batal/gagal, fokus
+  // keyboard dikembalikan ke Lanjut supaya tidak jatuh ke <body>.
+  useEffect(() => {
+    if (uploading || !refocusNext.current) return
+    refocusNext.current = false
+    nextRef.current?.focus()
+  }, [uploading])
+
+  const chooseType = (type) => {
+    setSourceType(type)
+    setFileError('')
+    setError('')
+    setAborted(false)
+  }
 
   const handleFile = (f) => {
     if (!f) return
-    const allowed = ['video/mp4', 'video/avi', 'video/quicktime', 'video/x-matroska', 'video/webm']
-    if (!allowed.includes(f.type) && !f.name.match(/\.(mp4|avi|mov|mkv|webm)$/i)) {
-      setError('Format tidak didukung. Pakai MP4, AVI, MOV, MKV, atau WebM ya.')
+    if (!VIDEO_TYPES.includes(f.type) && !/\.(mp4|avi|mov|mkv|webm)$/i.test(f.name)) {
+      setFileError('Format file tidak didukung. Pilih file MP4, AVI, MOV, MKV, atau WebM.')
       return
     }
     setVideoFile(f)
+    setUseActive(false)
+    setFileError('')
     setError('')
+    setAborted(false)
   }
 
+  const pickFile = () => fileRef.current?.click()
+
+  // Drop juga diterima di baris file terpilih (mengganti file), supaya file
+  // yang dilepas di sana tidak dibuka browser sebagai halaman
   const handleDrop = (e) => {
     e.preventDefault()
     setDragOver(false)
-    handleFile(e.dataTransfer.files[0])
+    if (!uploading) handleFile(e.dataTransfer.files[0])
   }
 
-  const handleNext = async () => {
-    setError('')
-    if (!sourceType) { setError('Pilih sumber video dulu ya!'); return }
-
-    if (sourceType === 'video') {
-      if (!videoFile) { setError('Upload file video dulu dong.'); return }
-      setUploading(true)
-      try {
-        const fd = new FormData()
-        fd.append('file', videoFile)
-        const res = await fetch(`${API_BASE}/upload`, { method: 'POST', body: fd })
-        const data = await res.json()
-        if (data.status !== 'ok') { setError(data.message || 'Upload gagal.'); return }
-        onNext({ sourceType: 'video', path: data.path, filename: data.filename })
-      } catch {
-        setError('Gagal konek ke backend. Pastiin backend sudah jalan ya.')
-      } finally {
-        setUploading(false)
+  // sourceInfo.reused: 'check' = ditemukan sebelum mengunggah (tidak diunggah),
+  // 'upload' = sudah terunggah tetapi isinya sama dengan file di server
+  // (pemeriksaan awal tidak bisa dilakukan), false = video baru
+  const startUpload = async () => {
+    const xhr = new XMLHttpRequest()
+    const check = new AbortController()
+    xhrRef.current = xhr
+    checkRef.current = check
+    lastPct.current = -1
+    refocusNext.current = true
+    setProgress({ loaded: 0, total: videoFile.size })
+    setChecking(true)
+    setUploading(true)
+    try {
+      // Video yang sama sudah ada di server deteksi: langsung dipakai
+      const found = await findOnServer(videoFile, check.signal)
+      if (check.signal.aborted) { setAborted(true); return }
+      checkRef.current = null
+      if (found) {
+        onNext({ sourceType: 'video', path: found.path, filename: found.filename, reused: 'check' })
+        return
       }
-    } else {
-      onNext({ sourceType: 'camera', camIndex })
+      setChecking(false)
+      const data = await uploadVideo(xhr, videoFile, (loaded, total) => {
+        // Render ulang hanya tiap naik 1 %: file ratusan MB memicu ribuan event
+        const pct = Math.floor((loaded / total) * 100)
+        if (pct === lastPct.current) return
+        lastPct.current = pct
+        setProgress({ loaded, total })
+      })
+      if (data.status !== 'ok') {
+        setError(withMessage('Unggahan gagal', data.message, 'Coba lagi atau pilih file lain.'))
+        return
+      }
+      onNext({ sourceType: 'video', path: data.path, filename: data.filename, reused: data.reused ? 'upload' : false })
+    } catch (err) {
+      if (err?.name === 'AbortError') setAborted(true)
+      else setError(NO_SERVER)
+    } finally {
+      xhrRef.current = null
+      checkRef.current = null
+      setChecking(false)
+      setUploading(false)
     }
   }
 
+  // Saat memeriksa, XHR belum dikirim (abort() XHR tidak berefek): yang
+  // dibatalkan pemeriksaannya; startUpload lalu berhenti sebelum mengunggah
+  const cancelUpload = () => {
+    if (checkRef.current) checkRef.current.abort()
+    else xhrRef.current?.abort()
+  }
+
+  const handleNext = () => {
+    setError('')
+    setAborted(false)
+    if (sourceType === 'camera') {
+      onNext({ sourceType: 'camera', camIndex })
+      return
+    }
+    if (useActive && activeVideo && !videoFile) {
+      onNext({ sourceType: 'video', path: activeVideo.path, filename: activeVideo.filename })
+      return
+    }
+    if (videoFile) startUpload()
+  }
+
+  // Alasan tombol nonaktif. Opsi "video yang sedang aktif" hanya disebut
+  // kalau memang tersedia.
+  const hasVideo = Boolean(videoFile) || (useActive && Boolean(activeVideo))
+  let reason = ''
+  if (!sourceType) reason = 'Pilih sumber video untuk melanjutkan.'
+  else if (sourceType === 'video' && !hasVideo) {
+    reason = activeVideo
+      ? 'Pilih file video atau pakai video yang sedang aktif.'
+      : 'Pilih file video untuk melanjutkan.'
+  }
+
+  const pct = progress.total ? (progress.loaded / progress.total) * 100 : 0
+  const sizeText = checking
+    ? 'Mencari di server deteksi…'
+    : `${formatMB(progress.loaded)} dari ${formatMB(progress.total)} MB`
+  // Seluruh file sudah terkirim: server deteksi tetap menyimpannya walau
+  // koneksi diputus, jadi "Batalkan" tidak lagi ditawarkan sebagai pembatalan
+  const sent = progress.total > 0 && progress.loaded >= progress.total
+
   return (
-    <div className="wizard-enter space-y-5">
-      <div>
-        <h2 className="text-xl font-bold" style={{ color: 'var(--text)' }}>
-          Dari mana sumber videonya? 📹
-        </h2>
-        <p className="text-sm mt-1" style={{ color: 'var(--text-dim)' }}>
-          Bisa dari file video yang udah ada, atau langsung dari kamera
-        </p>
-      </div>
+    <>
+      <h1 ref={titleRef} tabIndex={-1} className="wizard-title focus:outline-none">Pilih sumber video</h1>
+      <p className="wizard-lead">Rekaman video atau kamera yang terhubung ke komputer ini.</p>
 
-      <div className="space-y-3">
-        <OptionCard
-          selected={sourceType === 'video'}
-          onClick={() => setSourceType('video')}
-          icon="🎬"
-          title="Upload File Video"
-          desc="MP4, AVI, MOV, MKV, WebM — cocok buat testing atau analisis rekaman"
-        />
-        <OptionCard
-          selected={sourceType === 'camera'}
-          onClick={() => setSourceType('camera')}
-          icon="📷"
-          title="Kamera Langsung"
-          desc="Pantau real-time langsung dari webcam atau kamera IP"
-          badge="Live"
-        />
-      </div>
+      <fieldset className="opt-list wizard-group" disabled={uploading}>
+        <legend className="sr-only">Sumber video</legend>
+        <label className="opt">
+          <input
+            type="radio"
+            name="source"
+            value="video"
+            checked={sourceType === 'video'}
+            onChange={() => chooseType('video')}
+          />
+          <span>
+            <span className="opt-title">File video</span>
+            <span className="opt-desc">Rekaman MP4, AVI, MOV, MKV, atau WebM.</span>
+          </span>
+        </label>
+        <label className="opt">
+          <input
+            type="radio"
+            name="source"
+            value="camera"
+            checked={sourceType === 'camera'}
+            onChange={() => chooseType('camera')}
+          />
+          <span>
+            <span className="opt-title">Kamera</span>
+            <span className="opt-desc">Kamera bawaan atau USB yang terhubung ke komputer ini.</span>
+          </span>
+        </label>
+      </fieldset>
 
-      {/* File upload area */}
       {sourceType === 'video' && (
-        <div className="space-y-3 fade-in">
-          <div
-            className="relative rounded-xl p-6 text-center transition-all duration-200 cursor-pointer"
-            style={{
-              border: `2px dashed ${dragOver ? 'var(--cyan)' : videoFile ? 'rgba(34,211,238,0.4)' : 'var(--edge)'}`,
-              background: dragOver ? 'rgba(34,211,238,0.04)' : videoFile ? 'rgba(34,211,238,0.03)' : 'rgba(255,255,255,0.01)',
-            }}
-            onClick={() => fileRef.current?.click()}
-            onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
-            onDragLeave={() => setDragOver(false)}
-            onDrop={handleDrop}
-          >
-            <input
-              ref={fileRef}
-              type="file"
-              accept="video/*"
-              className="hidden"
-              onChange={(e) => handleFile(e.target.files[0])}
-            />
-            {videoFile ? (
-              <div className="space-y-1">
-                <span className="text-2xl">✅</span>
-                <p className="text-sm font-medium" style={{ color: 'var(--text)' }}>{videoFile.name}</p>
-                <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
-                  {(videoFile.size / 1024 / 1024).toFixed(1)} MB — klik untuk ganti
-                </p>
+        <div className="wizard-group">
+          {videoFile ? (
+            <div className="file-row" onDragOver={(e) => e.preventDefault()} onDrop={handleDrop}>
+              <span className="file-row-name" title={videoFile.name}>{videoFile.name}</span>
+              <span className="file-row-size">{formatMB(videoFile.size)} MB</span>
+              <button ref={changeBtnRef} type="button" className="btn btn-sm" onClick={pickFile} disabled={uploading}>
+                Ganti file…
+              </button>
+            </div>
+          ) : (
+            <div
+              className={dragOver ? 'dropzone is-over' : 'dropzone'}
+              onDragOver={(e) => { e.preventDefault(); setDragOver(true) }}
+              onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setDragOver(false) }}
+              onDrop={handleDrop}
+            >
+              <div className="dropzone-line">
+                Seret file video ke sini, atau
+                <button type="button" className="btn btn-sm" onClick={pickFile}>Pilih file…</button>
               </div>
-            ) : (
-              <div className="space-y-2">
-                <span className="text-3xl">📂</span>
-                <p className="text-sm" style={{ color: 'var(--text-dim)' }}>
-                  Drag & drop video di sini, atau <span style={{ color: 'var(--cyan)' }}>klik untuk browse</span>
-                </p>
-                <p className="text-xs" style={{ color: 'var(--text-muted)' }}>MP4, AVI, MOV, MKV, WebM</p>
-              </div>
-            )}
-          </div>
+              <div className="dropzone-caption">MP4, AVI, MOV, MKV, atau WebM</div>
+            </div>
+          )}
+          {/* Input asli tetap di DOM (sr-only, bukan hidden); keyboard memakai tombolnya.
+              value dikosongkan supaya file yang sama bisa dipilih lagi. */}
+          <input
+            ref={fileRef}
+            type="file"
+            accept="video/*"
+            className="sr-only"
+            tabIndex={-1}
+            aria-hidden="true"
+            onChange={(e) => { handleFile(e.target.files[0]); e.target.value = '' }}
+          />
+          {fileError && <ErrorNote className="mt-2">{fileError}</ErrorNote>}
+
+          {activeVideo && !videoFile && (
+            <label className="check-row mt-3">
+              <input
+                type="checkbox"
+                checked={useActive}
+                onChange={(e) => { setUseActive(e.target.checked); setError('') }}
+              />
+              <span>
+                <span className="check-row-title">Pakai video yang sedang aktif: {activeVideo.filename}</span>
+                <span className="check-row-help">Sudah ada di server deteksi, tidak perlu diunggah ulang.</span>
+              </span>
+            </label>
+          )}
         </div>
       )}
 
-      {/* Camera index selector */}
       {sourceType === 'camera' && (
-        <div className="space-y-2 fade-in">
-          <label className="text-xs" style={{ color: 'var(--text-dim)' }}>Index Kamera</label>
-          <div className="flex gap-2">
+        <div className="wizard-group">
+          <span className="field-label" id="cam-label">Indeks kamera</span>
+          {/* Radio asli (sr-only) di dalam label: panah kiri/kanan tetap berfungsi */}
+          <div className="seg flex mt-2" role="radiogroup" aria-labelledby="cam-label">
             {[0, 1, 2, 3].map(i => (
-              <button
-                key={i}
-                onClick={() => setCamIndex(i)}
-                className="w-11 h-11 rounded-xl text-sm font-bold transition-all duration-150"
-                style={{
-                  background: camIndex === i ? 'rgba(34,211,238,0.12)' : 'rgba(255,255,255,0.03)',
-                  border: `1.5px solid ${camIndex === i ? 'rgba(34,211,238,0.45)' : 'var(--edge)'}`,
-                  color: camIndex === i ? 'var(--cyan)' : 'var(--text-dim)',
-                }}
-              >
+              <label key={i}>
+                <input
+                  type="radio"
+                  className="sr-only"
+                  name="camera"
+                  value={i}
+                  checked={camIndex === i}
+                  onChange={() => setCamIndex(i)}
+                />
                 {i}
-              </button>
+              </label>
             ))}
           </div>
-          <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
-            Biasanya webcam bawaan = 0, kamera eksternal = 1, 2, dst
-          </p>
+          <p className="help mt-2">Kamera bawaan biasanya 0. Kamera USB biasanya 1 atau lebih.</p>
         </div>
       )}
 
-      {error && (
-        <div className="px-3 py-2 rounded-lg text-xs" style={{ background: 'var(--red-soft)', color: 'var(--red)', border: '1px solid rgba(248,113,113,0.2)' }}>
-          ⚠️ {error}
+      {uploading ? (
+        <div className="wizard-group upload">
+          <div className="upload-head">
+            <span className="upload-name" title={videoFile.name}>
+              {checking ? 'Memeriksa' : 'Mengunggah'} {videoFile.name}
+            </span>
+            <span className="upload-size">{sizeText}</span>
+          </div>
+          <div
+            className="progress"
+            role="progressbar"
+            aria-label={`${checking ? 'Memeriksa' : 'Mengunggah'} ${videoFile.name}`}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={Math.round(pct)}
+            aria-valuetext={sizeText}
+          >
+            {/* Lebar diset per event (tiap 1 %), tanpa transisi */}
+            <div className="progress-fill" style={{ width: `${pct}%` }} />
+          </div>
+          <div>
+            {/* aria-disabled (bukan disabled) supaya fokus keyboard tidak jatuh ke <body> */}
+            <button
+              type="button"
+              className="btn btn-sm"
+              autoFocus
+              aria-disabled={sent}
+              onClick={() => { if (!sent) cancelUpload() }}
+            >
+              Batalkan
+            </button>
+            {sent && <p className="help mt-2" role="status">Menyimpan di server deteksi…</p>}
+          </div>
+        </div>
+      ) : (
+        <div className="wizard-group grid gap-2">
+          <button
+            ref={nextRef}
+            type="button"
+            className="btn btn-primary w-full"
+            disabled={Boolean(reason)}
+            onClick={handleNext}
+          >
+            Lanjut
+          </button>
+          {reason && <p className="reason">{reason}</p>}
+          {error && <ErrorNote>{error}</ErrorNote>}
+          {aborted && (
+            <div className="note" role="status"><p>Unggahan dibatalkan.</p></div>
+          )}
         </div>
       )}
-
-      <button
-        onClick={handleNext}
-        disabled={!sourceType || uploading}
-        className="w-full py-3 rounded-xl font-semibold text-sm transition-all duration-200 disabled:opacity-30 disabled:cursor-not-allowed"
-        style={{
-          background: 'linear-gradient(135deg, rgba(34,211,238,0.2), rgba(34,211,238,0.1))',
-          border: '1px solid rgba(34,211,238,0.4)',
-          color: 'var(--cyan)',
-        }}
-      >
-        {uploading ? '⏳ Uploading...' : 'Lanjut →'}
-      </button>
-    </div>
+    </>
   )
 }
 
 // ─── POST /configure ──────────────────────────────────────────
-// Dipakai langkah Mode ROI dan tombol "Coba lagi" di langkah gambar zona.
+// Dipakai langkah 2 dan tombol "Coba lagi" di halaman gambar zona.
 // Mengembalikan JSON jawaban backend ({ status, message?, ... }).
 async function sendConfigure(sourceInfo, roiMode) {
   const body = {
@@ -283,496 +497,458 @@ async function sendConfigure(sourceInfo, roiMode) {
   return res.json()
 }
 
-// ─── Step 1: Pilih Mode ROI ───────────────────────────────────
-function StepROIMode({ sourceInfo, onNext, onBack }) {
-  const [roiMode, setRoiMode] = useState(null)
+// ─── Langkah 2: cara menentukan zona ─────────────────────────
+function StepZoneMode({ sourceInfo, initialMode, focusTitle, onNext, onBack }) {
+  const [roiMode, setRoiMode] = useState(initialMode ?? null)   // 'auto' | 'manual'
   const [loading, setLoading] = useState(false)
-  const [error, setError]     = useState('')
+  const [error,   setError]   = useState('')
+  const titleRef = useRef(null)
+
+  useEffect(() => { if (focusTitle) titleRef.current?.focus() }, [focusTitle])
 
   const handleNext = async () => {
-    if (!roiMode) { setError('Pilih dulu mode zona parkir nya ya!'); return }
+    if (!roiMode) return
     setLoading(true)
     setError('')
     try {
       const data = await sendConfigure(sourceInfo, roiMode)
-      if (data.status !== 'ok') { setError(data.message || 'Konfigurasi gagal.'); return }
-
-      onNext({ roiMode })
+      if (data.status !== 'ok') { setError(withMessage('Sumber video tidak bisa dibuka', data.message)); return }
+      onNext(roiMode)
     } catch {
-      setError('Gagal konek ke backend.')
+      setError(NO_SERVER)
     } finally {
       setLoading(false)
     }
   }
 
+  const name = sourceLabelOf(sourceInfo)
+
   return (
-    <div className="wizard-enter space-y-5">
-      <div>
-        <h2 className="text-xl font-bold" style={{ color: 'var(--text)' }}>
-          Tentuin zona larangan parkir 🗺️
-        </h2>
-        <p className="text-sm mt-1" style={{ color: 'var(--text-dim)' }}>
-          Zona ini yang bakal dipantau sistem — kendaraan yang parkir di sini bakalan ke-detect
-        </p>
+    <>
+      <h1 ref={titleRef} tabIndex={-1} className="wizard-title focus:outline-none">Tentukan zona larangan parkir</h1>
+      <p className="wizard-lead">Kendaraan yang berhenti di dalam zona dihitung lama berhentinya.</p>
+      <div className="mt-3 flex min-w-0">
+        <span className="meta">
+          <span className="meta-label">Sumber</span>
+          <span className="meta-value" title={name}>{name}</span>
+        </span>
       </div>
-
-      <div className="space-y-3">
-        <OptionCard
-          selected={roiMode === 'manual'}
-          onClick={() => setRoiMode('manual')}
-          icon="✏️"
-          title="Gambar Sendiri"
-          desc="Kamu gambar polygon zona larangan langsung di frame videonya — bisa buat lebih dari 1 zona"
-        />
-        <OptionCard
-          selected={roiMode === 'auto'}
-          onClick={() => setRoiMode('auto')}
-          icon="🤖"
-          title="Otomatis"
-          desc="Sistem pakai seluruh frame sebagai zona pantau — cocok kalau mau monitor semua area"
-          badge="Rekomendasi"
-        />
-      </div>
-
-      {error && (
-        <div className="px-3 py-2 rounded-lg text-xs" style={{ background: 'var(--red-soft)', color: 'var(--red)', border: '1px solid rgba(248,113,113,0.2)' }}>
-          ⚠️ {error}
-        </div>
+      {sourceInfo?.reused === 'check' && (
+        <p className="help mt-2">Video yang sama sudah ada di server deteksi, jadi tidak diunggah ulang.</p>
+      )}
+      {sourceInfo?.reused === 'upload' && (
+        <p className="help mt-2">Isi video ini sama dengan {name} yang sudah ada di server deteksi, jadi file itu yang dipakai.</p>
       )}
 
-      <div className="flex gap-2">
-        <button
-          onClick={onBack}
-          className="py-3 px-5 rounded-xl text-sm transition-all duration-200"
-          style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid var(--edge)', color: 'var(--text-dim)' }}
-        >
-          ← Balik
-        </button>
-        <button
-          onClick={handleNext}
-          disabled={!roiMode || loading}
-          className="flex-1 py-3 rounded-xl font-semibold text-sm transition-all duration-200 disabled:opacity-30 disabled:cursor-not-allowed"
-          style={{
-            background: 'linear-gradient(135deg, rgba(34,211,238,0.2), rgba(34,211,238,0.1))',
-            border: '1px solid rgba(34,211,238,0.4)',
-            color: 'var(--cyan)',
-          }}
-        >
-          {loading ? '⏳ Menghubungkan...' : roiMode === 'auto' ? 'Langsung Mulai 🚀' : 'Lanjut Gambar Zona →'}
-        </button>
+      {/* "Seluruh frame" (roi_mode 'auto') sengaja di urutan pertama: pilihan yang disarankan */}
+      <fieldset className="opt-list wizard-group" disabled={loading}>
+        <legend className="sr-only">Cara menentukan zona</legend>
+        <label className="opt">
+          <input
+            type="radio"
+            name="roi-mode"
+            value="auto"
+            checked={roiMode === 'auto'}
+            onChange={() => setRoiMode('auto')}
+          />
+          <span>
+            <span className="opt-title">Seluruh frame</span>
+            <span className="opt-tag">Disarankan</span>
+            <span className="opt-desc">
+              Semua kendaraan yang berhenti di mana pun dalam gambar dihitung lama berhentinya.
+            </span>
+          </span>
+        </label>
+        <label className="opt">
+          <input
+            type="radio"
+            name="roi-mode"
+            value="manual"
+            checked={roiMode === 'manual'}
+            onChange={() => setRoiMode('manual')}
+          />
+          <span>
+            <span className="opt-title">Gambar zona</span>
+            <span className="opt-desc">
+              Tandai satu atau beberapa area pada frame. Kendaraan di luar area tidak dihitung.
+            </span>
+          </span>
+        </label>
+      </fieldset>
+
+      <section className="wizard-group" aria-labelledby="wz-rule-title">
+        <h2 id="wz-rule-title" className="block-title">Aturan waktu</h2>
+        <RuleLane className="mt-3" />
+      </section>
+
+      <div className="wizard-group">
+        <div className="wizard-actions">
+          <button type="button" className="btn" onClick={onBack} disabled={loading}>Kembali</button>
+          <button type="button" className="btn btn-primary" disabled={!roiMode || loading} onClick={handleNext}>
+            {loading ? 'Menyiapkan sumber…' : roiMode === 'manual' ? 'Lanjut ke gambar zona' : 'Mulai pemantauan'}
+          </button>
+        </div>
+        {!roiMode && <p className="reason mt-2">Pilih cara menentukan zona untuk melanjutkan.</p>}
+        {error && <ErrorNote className="mt-2">{error}</ErrorNote>}
       </div>
+    </>
+  )
+}
+
+// Hitungan detik 1 Hz selama frame pertama ditunggu, tanda sistem masih
+// bekerja (di mini PC membuka sumber bisa beberapa menit). Komponen sendiri
+// supaya tiap detik hanya teks ini yang dirender ulang; mulai dari 0 lagi
+// setiap kali dipasang (mis. setelah "Coba lagi").
+function FrameWait({ slow }) {
+  const [secs, setSecs] = useState(0)
+  useEffect(() => {
+    const startedAt = Date.now()
+    const id = setInterval(() => setSecs(Math.floor((Date.now() - startedAt) / 1000)), 1000)
+    return () => clearInterval(id)
+  }, [])
+  return (
+    <div className="well-msg z-[15]">
+      <p className="well-msg-title">Mengambil frame pertama… <span className="tnum">{secs}</span> dtk</p>
+      {slow && (
+        <p>Server deteksi masih membuka sumber video. Di komputer ini bisa beberapa menit. Tidak perlu diulang.</p>
+      )}
     </div>
   )
 }
 
-// ─── Canvas ROI drawing ───────────────────────────────────────
-// imgRect = kotak frame yang benar-benar tampil di canvas (lihat lib/roiGeometry.js)
-function drawCanvas(canvas, allRois, currentPoints, imgRect) {
-  const ctx = canvas.getContext('2d')
-  ctx.clearRect(0, 0, canvas.width, canvas.height)
-  if (!imgRect) return   // frame belum ada → belum ada yang bisa digambar
-
-  const toCanvas = (pts) => pts.map(p => normalizedToCanvas(p, imgRect))
-
-  const colors = ['#22d3ee', '#fbbf24', '#4ade80', '#a78bfa', '#f87171']
-
-  // Draw completed ROIs
-  allRois.forEach((roi, idx) => {
-    const px = toCanvas(roi)
-    const color = colors[idx % colors.length]
-    ctx.beginPath()
-    ctx.moveTo(px[0].x, px[0].y)
-    px.slice(1).forEach(p => ctx.lineTo(p.x, p.y))
-    ctx.closePath()
-    ctx.fillStyle = color + '18'
-    ctx.fill()
-    ctx.strokeStyle = color + 'bb'
-    ctx.lineWidth = 1.5
-    ctx.setLineDash([])
-    ctx.stroke()
-
-    // Label
-    const cx = px.reduce((s, p) => s + p.x, 0) / px.length
-    const cy = px.reduce((s, p) => s + p.y, 0) / px.length
-    ctx.font = 'bold 11px DM Sans, sans-serif'
-    ctx.fillStyle = color
-    ctx.textAlign = 'center'
-    ctx.fillText(`Zona ${idx + 1}`, cx, cy)
-    ctx.textAlign = 'left'
-
-    px.forEach(p => {
-      ctx.beginPath(); ctx.arc(p.x, p.y, 4, 0, Math.PI * 2)
-      ctx.fillStyle = color; ctx.fill()
-    })
-  })
-
-  // Draw current in-progress polygon
-  if (currentPoints.length > 0) {
-    const px = toCanvas(currentPoints)
-    ctx.beginPath()
-    ctx.moveTo(px[0].x, px[0].y)
-    px.slice(1).forEach(p => ctx.lineTo(p.x, p.y))
-    if (currentPoints.length >= 3) {
-      ctx.closePath()
-      ctx.fillStyle = 'rgba(34,211,238,0.07)'
-      ctx.fill()
-    }
-    ctx.strokeStyle = 'rgba(34,211,238,0.75)'
-    ctx.lineWidth = 1.5
-    ctx.setLineDash([7, 4])
-    ctx.stroke()
-    ctx.setLineDash([])
-
-    px.forEach((p, i) => {
-      ctx.beginPath(); ctx.arc(p.x, p.y, i === 0 ? 6 : 4, 0, Math.PI * 2)
-      ctx.fillStyle = i === 0 ? '#fbbf24' : '#22d3ee'
-      ctx.fill()
-      ctx.font = '600 9px Share Tech Mono, monospace'
-      ctx.fillStyle = i === 0 ? '#fbbf24' : '#22d3ee'
-      ctx.fillText(`P${i + 1}`, p.x + 8, p.y - 5)
-    })
-  }
-}
-
-// ─── Step 2: Gambar ROI Manual ────────────────────────────────
-function StepDrawROI({ sourceInfo, onDone, onBack }) {
-  const canvasRef    = useRef(null)
-  const containerRef = useRef(null)
-  const redrawRef    = useRef(null)                  // fungsi gambar terbaru, dibaca ResizeObserver
-  const [allRois,    setAllRois]    = useState([])   // completed polygons
-  const [current,    setCurrent]    = useState([])   // points being drawn
+// ─── Langkah 2b: gambar zona ─────────────────────────────────
+// Area gambar = ZoneEditor (klik dikunci ke piksel video + kaca pembesar).
+// Panel samping lebarnya tetap 300px supaya kotak frame tidak berubah
+// ukuran selama menggambar.
+function StepDrawZones({ sourceInfo, onDone, onBack }) {
+  const [zones,      setZones]      = useState([])     // zona selesai
+  const [current,    setCurrent]    = useState([])     // titik zona yang sedang digambar
+  const [cleared,    setCleared]    = useState(null)   // { zones, current } sebelum "Hapus semua"
   const [saving,     setSaving]     = useState(false)
-  const [retrying,   setRetrying]   = useState(false) // "Coba lagi" sedang mengirim /configure
-  const [error,      setError]      = useState('')
+  const [retrying,   setRetrying]   = useState(false)  // "Coba lagi" sedang mengirim /configure
+  const [error,      setError]      = useState(null)   // { at: 'finish' | 'save', text }
+  const [retryError, setRetryError] = useState('')
+  const stageRef     = useRef(null)
+  const clearBtnRef  = useRef(null)
+  const refocusClear = useRef(false)
 
   // Frame pertama milik sumber yang BARU dikonfigurasi (polling sampai siap)
   const { frame, slow, procError, noSource, reload } = useFirstFrame()
   const failed  = Boolean(procError) || noSource     // frame tidak akan datang
   const loading = !frame && !failed
 
-  const redraw = useCallback(() => {
-    const c = canvasRef.current
-    if (!c) return
-    const imgRect = frame ? getImageRect(c.width, c.height, frame.width, frame.height) : null
-    drawCanvas(c, allRois, current, imgRect)
-  }, [allRois, current, frame])
+  // Tombol yang sedang difokus keyboard bisa jadi nonaktif setelah dipakai;
+  // fokus dipindah ke kotak frame supaya tidak jatuh ke <body>
+  const focusEditor = () => stageRef.current?.querySelector('.zone-box')?.focus()
 
+  // Setelah "Hapus semua" diurungkan, baris sebaris hilang; fokus ke tombolnya lagi
   useEffect(() => {
-    redrawRef.current = redraw
-    redraw()
-  }, [redraw])
+    if (cleared || !refocusClear.current) return
+    refocusClear.current = false
+    clearBtnRef.current?.focus()
+  }, [cleared])
 
-  // ResizeObserver dibuat sekali saja (bukan tiap klik); fungsi gambar terbaru lewat ref
-  useEffect(() => {
-    const c = canvasRef.current, d = containerRef.current
-    if (!c || !d) return
-    const obs = new ResizeObserver(() => {
-      c.width = c.clientWidth; c.height = c.clientHeight
-      redrawRef.current?.()
-    })
-    obs.observe(d)
-    return () => obs.disconnect()
-  }, [])
-
-  const handleClick = (e) => {
-    const c = canvasRef.current
-    if (!c || !frame) return
-    // Dinormalisasi terhadap kotak GAMBAR (bukan kotak canvas), di-clamp ke 0..1
-    const p = clientToNormalized(e.clientX, e.clientY, c.getBoundingClientRect(), frame.width, frame.height)
-    if (!p) return
+  // p sudah ternormalisasi (0..1) dan dikunci ke pusat piksel video oleh ZoneEditor
+  const addPoint = (p) => {
     setCurrent(prev => [...prev, p])
-    setError('')
+    setCleared(null)   // keadaan sudah berubah, "Hapus semua" tidak bisa diurungkan lagi
+    setError(null)
   }
 
-  const finishPolygon = () => {
-    if (current.length < 3) { setError('Minimal 3 titik buat satu zona ya!'); return }
-    setAllRois(prev => [...prev, current])
+  const finishZone = () => {
+    if (saving) return
+    if (current.length < 3) { setError({ at: 'finish', text: 'Satu zona butuh minimal 3 titik.' }); return }
+    setZones(prev => [...prev, current])
     setCurrent([])
+    setError(null)
   }
 
   const undoPoint = () => {
+    if (saving) return
     if (current.length > 0) setCurrent(prev => prev.slice(0, -1))
-    else if (allRois.length > 0) setAllRois(prev => prev.slice(0, -1))
+    else if (zones.length > 0) setZones(prev => prev.slice(0, -1))
   }
 
-  const clearAll = () => { setAllRois([]); setCurrent([]) }
+  const clearAll = () => {
+    setCleared({ zones, current })
+    setZones([])
+    setCurrent([])
+    setError(null)
+  }
+
+  const restoreCleared = () => {
+    if (!cleared) return
+    setZones(cleared.zones)
+    setCurrent(cleared.current)
+    refocusClear.current = true
+    setCleared(null)
+  }
+
+  // e.detail === 0: diaktifkan dari keyboard (Enter/Spasi), bukan klik mouse
+  const handleFinishClick = (e) => {
+    finishZone()
+    if (e.detail === 0) focusEditor()
+  }
+
+  const handleUndoClick = (e) => {
+    const emptyAfter = current.length + zones.length === 1
+    undoPoint()
+    if (emptyAfter && e.detail === 0) focusEditor()
+  }
 
   // "Coba lagi": processor tidak membuka ulang sumber yang gagal dengan
   // sendirinya, jadi konfigurasinya dikirim ulang dulu (POST /configure,
-  // isi sama dengan langkah Mode ROI) baru polling frame diulang.
+  // isi sama dengan langkah 2) baru polling frame diulang.
   const handleRetry = async () => {
     setRetrying(true)
-    setError('')
+    setRetryError('')
     try {
       const data = await sendConfigure(sourceInfo, 'manual')
-      if (data.status !== 'ok') { setError(data.message || 'Konfigurasi gagal.'); return }
+      if (data.status !== 'ok') { setRetryError(withMessage('Sumber video tidak bisa dibuka', data.message)); return }
       reload()
     } catch {
-      setError('Gagal konek ke backend.')
+      setRetryError(NO_SERVER)
     } finally {
       setRetrying(false)
     }
   }
 
   const handleSave = async () => {
-    const finalRois = current.length >= 3 ? [...allRois, current] : allRois
-    if (finalRois.length === 0) { setError('Gambar minimal 1 zona dulu ya!'); return }
+    const finalZones = current.length >= 3 ? [...zones, current] : zones
+    if (finalZones.length === 0) { setError({ at: 'save', text: 'Gambar minimal 1 zona.' }); return }
 
     setSaving(true)
-    setError('')
+    setError(null)
     try {
-      const roisPayload = finalRois.map(roi => roi.map(p => [p.x, p.y]))
+      const roisPayload = finalZones.map(roi => roi.map(p => [p.x, p.y]))
       const res = await fetch(`${API_BASE}/set_roi`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ rois: roisPayload }),
       })
       const data = await res.json()
-      if (data.status !== 'ok') { setError(data.message || 'Gagal simpan ROI.'); return }
-      onDone()
+      if (data.status !== 'ok') { setError({ at: 'save', text: withMessage('Zona tidak tersimpan', data.message) }); return }
+      onDone(finalZones.length)
     } catch {
-      setError('Gagal konek ke backend.')
+      setError({ at: 'save', text: NO_SERVER })
     } finally {
       setSaving(false)
     }
   }
 
+  const nothingDrawn = current.length === 0 && zones.length === 0
+  const saveCount    = zones.length + (current.length >= 3 ? 1 : 0)
+  const name         = sourceLabelOf(sourceInfo)
+
   return (
-    <div className="wizard-enter flex flex-col h-full gap-4">
-      <div className="shrink-0">
-        <h2 className="text-xl font-bold" style={{ color: 'var(--text)' }}>
-          Gambar zona larangan parkir ✏️
-        </h2>
-        <p className="text-sm mt-1" style={{ color: 'var(--text-dim)' }}>
-          Klik titik-titik di frame untuk bikin polygon. Bisa buat lebih dari 1 zona.
-        </p>
-      </div>
-
-      {/* Canvas area */}
-      <div
-        ref={containerRef}
-        className="relative flex-1 rounded-xl overflow-hidden scanline-wrap"
-        style={{
-          background: '#000',
-          border: '1px solid var(--edge)',
-          minHeight: '300px',
-        }}
-      >
-        {loading && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3" style={{ zIndex: 5 }}>
-            <div className="w-8 h-8 rounded-full border-2 border-t-transparent animate-spin" style={{ borderColor: 'var(--cyan)', borderTopColor: 'transparent' }} />
-            <p className="text-xs" style={{ color: 'var(--text-dim)' }}>Mengambil frame pertama...</p>
-            {slow && (
-              <p className="text-[11px] text-center px-6 leading-relaxed" style={{ color: 'var(--text-muted)' }}>
-                Backend masih membuka sumber videonya. Di komputer yang lambat ini bisa lama —
-                masih ditunggu, nggak perlu diulang.
-              </p>
-            )}
-          </div>
-        )}
-        {frame && (
-          <img
-            src={frame.url}
-            alt="First Frame"
-            className="absolute inset-0 w-full h-full object-contain"
-            style={{ zIndex: 1 }}
+    <div className="editor-page">
+      <WizardBar step={2} />
+      <main className="editor-body">
+        {/* Pembungkus hitam. Border/padding TIDAK dipasang di ZoneEditor: rumus
+            klik ke piksel butuh <img> dan <canvas> mengisi kotak yang sama.
+            Kolom flex supaya ZoneEditor tetap setinggi pembungkus di layar sempit
+            (tinggi baris auto, min-height 360). */}
+        <div ref={stageRef} className="editor-stage flex flex-col">
+          <ZoneEditor
+            frame={frame}
+            zones={zones}
+            current={current}
+            onAddPoint={addPoint}
+            onUndo={undoPoint}
+            onFinish={finishZone}
+            autoFocus
+            disabled={saving}
+            className="flex-1 min-h-0"
           />
-        )}
-        <canvas
-          ref={canvasRef}
-          onClick={frame ? handleClick : undefined}
-          className="absolute inset-0 w-full h-full"
-          style={{ zIndex: 10, cursor: loading ? 'wait' : frame ? 'crosshair' : 'default' }}
-        />
 
-        {/* Frame tidak akan datang (processor gagal membuka sumber, atau backend
-            belum punya sumber) → tampilkan penyebabnya + jalan keluar */}
-        {failed && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center" style={{ zIndex: 15 }}>
-            <div className="px-3 py-2 rounded-lg text-xs" style={{ background: 'var(--red-soft)', color: 'var(--red)', border: '1px solid rgba(248,113,113,0.2)' }}>
-              ⚠️ {procError
-                ? `Processor berhenti: ${procError}`
-                : 'Backend belum punya sumber video (mungkin baru di-restart).'}
+          {frame && nothingDrawn && (
+            <div className="plate-video absolute top-3 left-1/2 -translate-x-1/2 z-[15] whitespace-nowrap">
+              Klik frame untuk menambah titik zona
             </div>
-            <p className="text-xs" style={{ color: 'var(--text-dim)' }}>
-              {procError
-                ? 'Coba lagi kalau sumbernya sudah siap, atau balik buat ganti mode atau sumber.'
-                : 'Coba lagi buat kirim ulang konfigurasinya, atau balik buat ganti mode atau sumber.'}
+          )}
+
+          {loading && <FrameWait slow={slow} />}
+
+          {/* Frame tidak akan datang (processor gagal membuka sumber, atau backend
+              belum punya sumber): tampilkan penyebabnya + jalan keluar */}
+          {failed && (
+            <div className="absolute inset-0 z-[15] grid place-items-center p-4">
+              <div className="note note-frame" role="alert">
+                <FaultGlyph />
+                <div>
+                  <p>
+                    <strong>
+                      {procError
+                        ? `Processor berhenti: ${procError}`
+                        : 'Server deteksi belum punya sumber video, mungkin karena baru dijalankan ulang.'}
+                    </strong>
+                  </p>
+                  <p>Pilih Coba lagi setelah sumber siap, atau Kembali untuk mengganti sumber atau cara menentukan zona.</p>
+                  <div className="note-actions">
+                    <button type="button" className="btn btn-sm" onClick={onBack}>Kembali</button>
+                    <button type="button" className="btn btn-sm btn-primary" onClick={handleRetry} disabled={retrying}>
+                      {retrying ? 'Mengirim ulang…' : 'Coba lagi'}
+                    </button>
+                  </div>
+                  {retryError && <p className="mt-3">{retryError}</p>}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <aside className="editor-side" aria-labelledby="wz-draw-title">
+          {/* Bagian atas bisa digulir kalau daftar zona panjang; tombol tetap terlihat */}
+          <div className="editor-side-scroll scroll-thin">
+            <h1 id="wz-draw-title" className="side-title">Gambar zona larangan parkir</h1>
+            <span className="meta">
+              <span className="meta-label">Sumber</span>
+              <span className="meta-value" title={name}>{name}</span>
+            </span>
+            <ol className="steps">
+              <li>Klik sudut-sudut zona pada frame.</li>
+              <li>Pilih Selesaikan zona setelah minimal 3 titik. Ulangi untuk zona lain.</li>
+              <li>Pilih Simpan dan mulai.</li>
+            </ol>
+            <p className="side-note">
+              Kaca pembesar menunjukkan piksel video di bawah kursor. Titik disimpan tepat pada koordinat X dan Y yang tertera.
             </p>
-            <div className="flex gap-2">
+            <p className="side-note-dim">
+              Keyboard: panah menggeser 1 piksel, Shift dan panah 10 piksel, Enter menambah titik, Backspace mengurungkan.
+            </p>
+
+            <section aria-labelledby="wz-zone-list-title">
+              <div className="zone-list-head">
+                <h2 id="wz-zone-list-title" className="zone-list-title">Zona</h2>
+                <span className="zone-list-count">{zones.length} selesai</span>
+              </div>
+              {nothingDrawn ? (
+                <p className="zone-empty">Belum ada zona. Klik frame untuk menaruh titik pertama.</p>
+              ) : (
+                <ul>
+                  {zones.map((zone, i) => (
+                    <li key={i} className="zone-row">
+                      <span className="zone-row-name">Zona {i + 1}</span>
+                      <span className="zone-row-count">{zone.length} titik</span>
+                    </li>
+                  ))}
+                  {current.length > 0 && (
+                    <li className="zone-row is-draft">
+                      <span className="zone-row-name">Zona {zones.length + 1} sedang digambar</span>
+                      <span className="zone-row-count">{current.length} titik</span>
+                    </li>
+                  )}
+                </ul>
+              )}
+            </section>
+          </div>
+
+          <div className="editor-actions">
+            <button
+              type="button"
+              className="btn w-full"
+              disabled={current.length < 3 || saving}
+              onClick={handleFinishClick}
+            >
+              Selesaikan zona {zones.length + 1}
+            </button>
+            {current.length < 3 && <p className="reason">Butuh minimal 3 titik (sekarang {current.length}).</p>}
+            {error?.at === 'finish' && <ErrorNote>{error.text}</ErrorNote>}
+
+            <div className="btn-pair">
               <button
-                onClick={onBack}
-                className="py-2 px-4 rounded-xl text-xs transition-all"
-                style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid var(--edge)', color: 'var(--text-dim)' }}
+                type="button"
+                className="btn btn-sm"
+                title="Urungkan titik terakhir (Backspace)"
+                disabled={nothingDrawn || saving}
+                onClick={handleUndoClick}
               >
-                ← Balik
+                Urungkan
               </button>
               <button
-                onClick={handleRetry}
-                disabled={retrying}
-                className="py-2 px-4 rounded-xl text-xs font-semibold transition-all disabled:opacity-30"
-                style={{ background: 'rgba(34,211,238,0.1)', border: '1px solid rgba(34,211,238,0.35)', color: 'var(--cyan)' }}
+                ref={clearBtnRef}
+                type="button"
+                className="btn btn-sm"
+                disabled={nothingDrawn || saving}
+                onClick={clearAll}
               >
-                {retrying ? '⏳ Mengirim ulang...' : '↻ Coba lagi'}
+                Hapus semua
               </button>
             </div>
-          </div>
-        )}
+            {cleared && (
+              <div className="inline-line" role="status">
+                <span>Semua zona dihapus.</span>
+                <button type="button" className="btn btn-sm" autoFocus onClick={restoreCleared}>Urungkan</button>
+              </div>
+            )}
 
-        {/* Floating hints */}
-        {frame && current.length === 0 && allRois.length === 0 && (
-          <div className="absolute top-3 left-1/2 -translate-x-1/2 pointer-events-none" style={{ zIndex: 15 }}>
-            <div
-              className="px-4 py-2 rounded-full text-xs whitespace-nowrap"
-              style={{ background: 'rgba(8,9,15,0.85)', border: '1px solid var(--edge)', color: 'var(--text-dim)', backdropFilter: 'blur(8px)' }}
+            <button
+              type="button"
+              className="btn btn-primary w-full"
+              disabled={saving || saveCount === 0}
+              onClick={handleSave}
             >
-              Klik di frame buat nambahin titik zona
-            </div>
+              {saving ? 'Menyimpan…' : `Simpan ${saveCount} zona dan mulai`}
+            </button>
+            {saveCount === 0 && !saving && <p className="reason">Gambar minimal 1 zona.</p>}
+            {error?.at === 'save' && <ErrorNote>{error.text}</ErrorNote>}
+
+            <button type="button" className="btn w-full" disabled={saving} onClick={onBack}>Kembali</button>
           </div>
-        )}
-
-        {/* Zone badges */}
-        {allRois.length > 0 && (
-          <div className="absolute top-3 right-3 pointer-events-none" style={{ zIndex: 15 }}>
-            <div
-              className="px-3 py-1.5 rounded-full text-xs font-semibold"
-              style={{ background: 'rgba(8,9,15,0.85)', border: '1px solid rgba(34,211,238,0.3)', color: 'var(--cyan)', backdropFilter: 'blur(8px)' }}
-            >
-              {allRois.length} zona tersimpan
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Toolbar */}
-      <div className="shrink-0 flex flex-col gap-2">
-        <div className="flex gap-2">
-          <button
-            onClick={finishPolygon}
-            disabled={current.length < 3}
-            className="flex-1 py-2.5 rounded-xl text-sm font-semibold transition-all disabled:opacity-30"
-            style={{
-              background: current.length >= 3 ? 'rgba(74,222,128,0.1)' : 'rgba(255,255,255,0.02)',
-              border: `1.5px solid ${current.length >= 3 ? 'rgba(74,222,128,0.35)' : 'var(--edge)'}`,
-              color: current.length >= 3 ? 'var(--green)' : 'var(--text-muted)',
-            }}
-          >
-            + Selesaikan Zona {allRois.length + 1} ({current.length} titik)
-          </button>
-          <button
-            onClick={undoPoint}
-            disabled={current.length === 0 && allRois.length === 0}
-            className="px-4 py-2.5 rounded-xl text-sm transition-all disabled:opacity-30"
-            style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid var(--edge)', color: 'var(--text-dim)' }}
-            title="Undo titik terakhir"
-          >
-            ↩
-          </button>
-          <button
-            onClick={clearAll}
-            disabled={current.length === 0 && allRois.length === 0}
-            className="px-4 py-2.5 rounded-xl text-sm transition-all disabled:opacity-30"
-            style={{ background: 'rgba(255,255,255,0.02)', border: '1px solid var(--edge)', color: 'var(--text-dim)' }}
-            title="Hapus semua"
-          >
-            ✕
-          </button>
-        </div>
-
-        {error && (
-          <div className="px-3 py-2 rounded-lg text-xs" style={{ background: 'var(--red-soft)', color: 'var(--red)', border: '1px solid rgba(248,113,113,0.2)' }}>
-            ⚠️ {error}
-          </div>
-        )}
-
-        <div className="flex gap-2">
-          <button
-            onClick={onBack}
-            className="py-3 px-5 rounded-xl text-sm transition-all"
-            style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid var(--edge)', color: 'var(--text-dim)' }}
-          >
-            ← Balik
-          </button>
-          <button
-            onClick={handleSave}
-            disabled={saving || (allRois.length === 0 && current.length < 3)}
-            className="flex-1 py-3 rounded-xl font-semibold text-sm transition-all disabled:opacity-30"
-            style={{
-              background: 'linear-gradient(135deg, rgba(34,211,238,0.2), rgba(34,211,238,0.1))',
-              border: '1px solid rgba(34,211,238,0.4)',
-              color: 'var(--cyan)',
-            }}
-          >
-            {saving ? '⏳ Menyimpan...' : `Simpan ${allRois.length + (current.length >= 3 ? 1 : 0)} Zona & Mulai 🚀`}
-          </button>
-        </div>
-      </div>
+        </aside>
+      </main>
     </div>
   )
 }
 
-// ─── Main wizard ──────────────────────────────────────────────
+// ─── Wizard ──────────────────────────────────────────────────
+// onComplete(info): info = { ...sourceInfo, roiMode: 'auto' | 'manual', zoneCount? }
+// sourceInfo video = { sourceType: 'video', path, filename },
+//            kamera = { sourceType: 'camera', camIndex }
+// zoneCount (jumlah zona yang disimpan) hanya ada untuk mode manual.
 export default function SetupWizard({ onComplete }) {
-  const [step,       setStep]       = useState(0)
+  const [step,       setStep]       = useState('source')   // 'source' | 'zone' | 'draw'
   const [sourceInfo, setSourceInfo] = useState(null)
+  const [roiMode,    setRoiMode]    = useState(null)       // diingat saat kembali dari gambar zona
+  // Judul langkah difokus hanya setelah berpindah langkah (tombol yang ditekan
+  // ikut hilang), bukan saat wizard pertama dibuka
+  const [moved,      setMoved]      = useState(false)
 
-  const handleSourceNext = (info) => { setSourceInfo(info); setStep(1) }
-  const handleROIModeNext = (info) => {
-    if (info.roiMode === 'auto') {
-      onComplete()   // auto mode → langsung ke dashboard
-    } else {
-      setStep(2)     // manual → lanjut gambar ROI
-    }
+  const go = (next) => { setMoved(true); setStep(next) }
+
+  const handleSourceNext = (info) => { setSourceInfo(info); go('zone') }
+  const handleModeNext = (mode) => {
+    setRoiMode(mode)
+    if (mode === 'auto') onComplete({ ...sourceInfo, roiMode: 'auto' })   // seluruh frame: langsung ke dashboard
+    else go('draw')
+  }
+
+  if (step === 'draw') {
+    return (
+      <StepDrawZones
+        sourceInfo={sourceInfo}
+        onDone={(n) => onComplete({ ...sourceInfo, roiMode: 'manual', zoneCount: n })}
+        onBack={() => go('zone')}
+      />
+    )
   }
 
   return (
-    <div
-      className="h-screen flex items-center justify-center p-4"
-      style={{ background: 'var(--void)' }}
-    >
-      <div
-        className="w-full max-w-lg glass rounded-3xl p-7 flex flex-col gap-6"
-        style={{
-          maxHeight: step === 2 ? '90vh' : 'auto',
-          boxShadow: '0 32px 80px rgba(0,0,0,0.6), 0 0 0 1px var(--edge)',
-        }}
-      >
-        {/* Header */}
-        <div className="flex items-center justify-between shrink-0">
-          <div className="flex items-center gap-3">
-            <div
-              className="w-9 h-9 rounded-xl flex items-center justify-center text-lg"
-              style={{ background: 'rgba(34,211,238,0.1)', border: '1px solid rgba(34,211,238,0.2)' }}
-            >
-              🅿️
-            </div>
-            <div>
-              <p className="font-bold text-sm" style={{ color: 'var(--text)' }}>Parking Guard</p>
-              <p className="text-[10px]" style={{ color: 'var(--text-muted)' }}>Setup konfigurasi</p>
-            </div>
-          </div>
-          <StepBar step={step} />
-        </div>
-
-        {/* Step content */}
-        <div className={`flex-1 ${step === 2 ? 'overflow-hidden flex flex-col' : ''}`}>
-          {step === 0 && <StepSource onNext={handleSourceNext} />}
-          {step === 1 && (
-            <StepROIMode
-              sourceInfo={sourceInfo}
-              onNext={handleROIModeNext}
-              onBack={() => setStep(0)}
-            />
-          )}
-          {step === 2 && (
-            <StepDrawROI
-              sourceInfo={sourceInfo}
-              onDone={onComplete}
-              onBack={() => setStep(1)}
-            />
-          )}
-        </div>
-      </div>
+    <div className="wizard-shell">
+      <WizardBar step={step === 'source' ? 1 : 2} />
+      <main className="wizard-col">
+        {step === 'source' ? (
+          <StepSource initial={sourceInfo} focusTitle={moved} onNext={handleSourceNext} />
+        ) : (
+          <StepZoneMode
+            sourceInfo={sourceInfo}
+            initialMode={roiMode}
+            focusTitle={moved}
+            onNext={handleModeNext}
+            onBack={() => go('source')}
+          />
+        )}
+      </main>
     </div>
   )
 }

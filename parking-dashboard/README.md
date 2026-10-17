@@ -53,34 +53,27 @@ Aplikasi memiliki 2 mode utama yang dikelola sebagai state machine sederhana di 
 ┌─────────────────────────────────────────────────┐
 │                 SETUP WIZARD                     │
 │                                                 │
-│  Step 0: Pilih Sumber Video                     │
-│  ├─ Upload file video (MP4/AVI/MOV/MKV/WebM)   │
-│  └─ Kamera langsung (webcam index 0–3)          │
+│  1 Sumber video                                 │
+│  ├─ File video (unggah, atau pakai video aktif)│
+│  └─ Kamera (indeks 0–3)                         │
 │              │                                   │
-│  Step 1: Pilih Mode Zona                         │
-│  ├─ Manual → lanjut ke Step 2                   │
-│  └─ Otomatis → langsung ke Dashboard            │
-│              │                                   │
-│  Step 2: Gambar Zona (hanya jika manual)         │
-│  ├─ Klik titik-titik di frame → polygon         │
-│  ├─ Bisa buat multiple zona                     │
-│  └─ Simpan → ke Dashboard                       │
+│  2 Zona larangan                                 │
+│  ├─ Seluruh frame (roi_mode auto) → Dashboard   │
+│  └─ Gambar zona (manual) → halaman editor zona │
+│       klik / keyboard, kaca pembesar, Simpan    │
 └──────────────────────┬──────────────────────────┘
                        │
                        ▼
 ┌─────────────────────────────────────────────────┐
 │                  DASHBOARD                       │
-│                                                 │
-│  ┌─────────┐  ┌──────────┐  ┌──────────────┐   │
-│  │ Header  │  │ Metric   │  │ Tombol       │   │
-│  │ + Clock │  │ Cards    │  │ Ganti Setup  │   │
-│  └─────────┘  └──────────┘  └──────────────┘   │
+│  Header: rambu, status deteksi, Ganti sumber…,  │
+│          jam; pelat "n pelanggaran" saat ada    │
 │                                                 │
 │  ┌────────────────────┐  ┌──────────────────┐   │
 │  │   VideoMonitor     │  │  AlertSidebar    │   │
-│  │   (MJPEG stream)   │  │  (WebSocket      │   │
-│  │                    │  │   real-time)      │   │
-│  │   [Update Zona]    │  │                  │   │
+│  │   Sumber / Zona    │  │  Kendaraan       │   │
+│  │   [Ubah zona…]     │  │  berhenti di zona│   │
+│  │   MJPEG + legenda  │  │  (lajur waktu)   │   │
 │  └────────────────────┘  └──────────────────┘   │
 └─────────────────────────────────────────────────┘
 ```
@@ -94,48 +87,37 @@ Aplikasi memiliki 2 mode utama yang dikelola sebagai state machine sederhana di 
 Mengelola state `view` (`'setup'` | `'dashboard'`):
 - Render `SetupWizard` saat pertama kali dibuka
 - Setelah setup selesai, switch ke `Dashboard`
-- Tombol "Ganti Setup" di dashboard mengembalikan ke wizard
+- Tombol "Ganti sumber…" di header mengembalikan ke wizard (Dashboard di-unmount → WebSocket dan MJPEG ditutup)
 
-Sub-komponen di dalam App.jsx:
-- **`LiveClock`** — Jam digital real-time (format Indonesia)
-- **`MetricCard`** — Kartu statistik (total kendaraan, warning, violation)
-- **`ConnectionBadge`** — Indikator status dengan tiga keadaan: **Live** (WebSocket tersambung dan processor berjalan), **Error** (tersambung, tetapi processor berhenti — penyebabnya muncul di tooltip), **Offline** (WebSocket putus)
+Isi header (`Dashboard`): rambu Dilarang Parkir (abu-abu saat normal, **menyala** saat ada pelanggaran) + pelat merah "n pelanggaran", status deteksi dari `proc.state` (dengan hitungan detik saat menunggu), "Ganti sumber…", dan jam. Status putus koneksi / processor berhenti tampil sebagai pelat abu-abu.
 
 ### `SetupWizard.jsx` — Wizard Konfigurasi
 
-Wizard 3 langkah dengan progress indicator:
-
-| Step | Komponen | API Call |
+| Langkah | Isi | API Call |
 |---|---|---|
-| 0 — Pilih Sumber | `StepSource` | `POST /upload` (jika video file) |
-| 1 — Mode Zona | `StepROIMode` | `POST /configure` |
-| 2 — Gambar ROI | `StepDrawROI` | `GET /first_frame` + `POST /set_roi` |
+| 1 Sumber video | File video (unggah dengan progres + Batalkan, atau "Pakai video yang sedang aktif"), atau Kamera. Sebelum mengunggah, sidik video (SHA-256 tiga potongan 1 MiB) dicocokkan ke server: video yang sudah ada di `uploads/` langsung dipakai tanpa unggah ulang, dan langkah 2 menyebutkannya | `GET /status`, `GET /upload/check`, `PUT /upload/stream` (XHR, body = isi file) |
+| 2 Zona larangan | "Seluruh frame" (`roi_mode: auto`) atau "Gambar zona" (`manual`) + legenda "Aturan waktu" | `POST /configure` |
+| Halaman gambar zona | `ZoneEditor` + panel samping (daftar zona, Selesaikan, Urungkan, Hapus semua dengan urungkan) | `GET /first_frame` + `POST /set_roi` |
 
-**Fitur di Step 2:**
-- Canvas overlay di atas frame pertama video
-- Klik untuk menambah titik polygon
-- Bisa buat multiple zona (masing-masing dengan warna berbeda)
-- Undo per-titik dan undo per-zona
-- Validasi minimal 3 titik per zona
+### `ZoneEditor.jsx` — Editor Zona (dipakai wizard dan dialog "Ubah zona")
+
+- Klik dikunci ke **piksel video** di bawah kursor dan disimpan sebagai pusat piksel, sehingga `int(x·W)` di backend menghasilkan piksel yang sama (terukur ≤ 0,35 px di stream backend)
+- Kaca pembesar 7× + pembacaan "X … Y …" dalam piksel video
+- Keyboard: panah 1 piksel, Shift+panah 10 piksel, Enter menambah titik, Backspace mengurungkan, Ctrl+Enter menyelesaikan zona
+- Zona digambar cyan `#00FFFF`, sama dengan garis zona yang ditulis backend di video
 
 ### `VideoMonitor.jsx` — Live Video Feed
 
-- Menampilkan MJPEG stream dari `GET /video_feed` via tag `<img>`
-- Indikator status stream (Streaming/Standby)
-- **ROI Update Panel**: overlay untuk menggambar ulang zona saat monitoring sudah berjalan, tanpa harus kembali ke wizard
-- Corner brackets decorative (gaya CCTV/security)
-- Offline placeholder dengan animasi pulse saat stream belum tersedia
+- Toolbar Sumber / Zona + tombol "Ubah zona…" (membuka `<dialog>` native berisi `ZoneEditor`; stream MJPEG dijeda selama dialog terbuka)
+- MJPEG stream dari `GET /video_feed` via tag `<img>` yang selalu ter-mount
+- Legenda di bawah video: arti tiap warna kotak yang ditulis backend (Zona, Memantau, Peringatan, Aman, Pelanggaran, Di luar zona) + label tick ("1,1 dtk/tick")
 
-### `AlertSidebar.jsx` — Feed Alert Real-time
+### `AlertSidebar.jsx` — Kendaraan berhenti di zona
 
-Menampilkan daftar kendaraan yang terdeteksi di zona pantau:
-
-- **Alert Card**: menampilkan tipe kendaraan, warna, zona, durasi, status
-- **Status badge**: Pelanggaran (merah), Peringatan (kuning), Aman (hijau), Memantau (abu)
-- **Progress bar**: visualisasi durasi relatif terhadap threshold 300 detik
-- **Sorting**: violation di atas, lalu warning, monitoring, safe
-- **Segment bar**: overview proporsi status di bagian atas
-- **Animasi**: card masuk dengan slide-up, violation card berkedip
+- Satu baris per kendaraan: glyph status (bentuk rambu), status, `LID{n}` (sama dengan label di video), jenis + warna dalam bahasa Indonesia, **lajur waktu** 0–6 menit dengan garis 1 mnt / 5 mnt (ambang backend 60 / 300 detik), durasi `m:ss`
+- Kalimat ringkasan menyebut hanya jumlah yang bukan nol; baris pelanggaran diberi latar merah sekali (animasi 200 ms satu kali)
+- Saat koneksi putus: baris jadi netral + "Data terakhir hh.mm.ss"
+- Pengumuman `aria-live` untuk kendaraan yang baru masuk Peringatan / Pelanggaran
 
 ### `useAlerts.js` — Custom Hook WebSocket
 
@@ -155,35 +137,13 @@ Return value: `{ alerts, stats, connected, error, proc }` — `proc` adalah stat
 
 ## Design System
 
-Didefinisikan di `index.css` menggunakan CSS custom properties:
+Desain "Rambu Menyala" (Okt 2026), disusun dari skill apple-design (Apple HIG: kontras, tipografi, layout, aksesibilitas) dan riset pendapat desainer tentang ciri UI "buatan AI". Spesifikasi lengkapnya ada di riwayat pengerjaan; ringkasnya:
 
-### Warna
-
-| Token | Hex | Kegunaan |
-|---|---|---|
-| `--void` | `#08090f` | Background utama |
-| `--cyan` | `#22d3ee` | Accent utama, elemen aktif |
-| `--amber` | `#fbbf24` | Warning status |
-| `--red` | `#f87171` | Violation status |
-| `--green` | `#4ade80` | Safe status |
-| `--purple` | `#a78bfa` | Badge/highlight sekunder |
-
-### Animasi
-
-| Class | Efek |
-|---|---|
-| `live-dot` | Pulse berkedip untuk indikator "Live" |
-| `scanline-wrap` | Efek garis scan ala CCTV |
-| `alert-enter` | Slide-up masuk untuk alert card |
-| `violation-pulse` | Glow berkedip untuk kartu violation |
-| `wizard-enter` | Fade + scale masuk untuk wizard step |
-
-### Font Stack
-
-- **DM Sans** — Body text
-- **Share Tech Mono** — Monospace (label, counter)
-
-Kedua font diambil dari Google Fonts di `index.html` **tanpa menahan render**: stylesheet-nya dimuat sebagai `media="print"` lalu diaktifkan saat selesai (`onload`), dengan `<noscript>` sebagai cadangan. Dashboard langsung tampil dengan font fallback (`sans-serif` / `monospace`) dan berganti ke font di atas begitu tersedia — jadi internet yang lambat atau putus tidak menunda tampilan.
+- **Warna hanya untuk arti.** Permukaan abu-abu netral; warna status sama 1:1 dengan kotak yang ditulis backend di video (kuning = Peringatan, merah = Pelanggaran, hijau = Aman, biru = Memantau, cyan = Zona). Merah hanya berarti pelanggaran. Tidak ada warna merek, gradien, ungu, atau glow.
+- **Satu elemen khas:** rambu Dilarang Parkir (PM 13/2014) yang menyala hanya saat aturan 300 detik dilanggar.
+- **Tema terang dan gelap** lewat `prefers-color-scheme` (mengikuti mode aplikasi Windows, tanpa tombol di aplikasi), plus `prefers-contrast: more` dan Windows High Contrast. Token di `:root` pada `index.css`; kontras semua pasangan teks ≥ 4,69:1.
+- **Font offline:** Overpass (`@fontsource-variable/overpass`, garis keturunan huruf rambu jalan) hanya untuk teks bergaya rambu dan angka; teks lain memakai Segoe UI bawaan Windows. Angka memakai `tabular-nums`.
+- **Tanpa GPU:** tidak ada animasi berulang, blur, filter, gradien, bayangan, atau transisi. Hanya dua animasi sekali jalan (`tintIn` 200 ms pada baris pelanggaran, `dlgIn` 150 ms pada dialog); keduanya 0 di `?lite` dan `prefers-reduced-motion`. Utilitas Tailwind untuk efek mahal dimatikan di `tailwind.config.js` (`corePlugins`).
 
 ---
 
@@ -227,7 +187,7 @@ Alamat backend ditentukan di satu tempat, `src/config.js`. File lain tidak menul
 
 | Export | Nilai | Dipakai untuk |
 |---|---|---|
-| `API_BASE` | `VITE_API_BASE`; kalau kosong: `http://<hostname halaman>:8000` | REST (`/upload`, `/configure`, `/first_frame`, `/set_roi`) |
+| `API_BASE` | `VITE_API_BASE`; kalau kosong: `http://<hostname halaman>:8000` | REST (`/upload/check`, `/upload/stream`, `/configure`, `/first_frame`, `/set_roi`) |
 | `WS_URL` | `API_BASE` dengan `http` → `ws`, ditambah `/ws/alerts` | WebSocket alert |
 | `STREAM_URL` | `API_BASE` + `/video_feed` | MJPEG stream |
 

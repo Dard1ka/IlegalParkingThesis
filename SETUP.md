@@ -144,12 +144,12 @@ Dashboard otomatis memanggil backend di `http://<hostname halaman>:8000`. Kalau 
 
 ### Alur penggunaan dashboard:
 
-1. Buka `http://localhost:5173`
-2. **Step 1 — Sumber Video**: Upload file video atau pilih kamera (index 0, 1, ...)
-3. **Step 2 — Zona Parkir**: Pilih "Gambar Sendiri" atau "Otomatis"
-   - *Gambar Sendiri*: Klik titik-titik di frame → Selesaikan zona → Simpan
-   - *Otomatis*: Langsung mulai, seluruh frame jadi zona pantau
-4. Dashboard aktif dengan live stream + alert real-time
+1. Buka `http://localhost:5173` (dev) atau `http://localhost:4173/?lite` (build, mini PC)
+2. **1 Sumber video**: "File video" (unggah, atau centang "Pakai video yang sedang aktif") atau "Kamera" (indeks 0, 1, ...)
+3. **2 Zona larangan**: pilih "Seluruh frame" atau "Gambar zona"
+   - *Gambar zona*: klik sudut-sudut zona (atau pakai keyboard), Selesaikan zona, lalu "Simpan n zona dan mulai"
+   - *Seluruh frame*: "Mulai pemantauan", seluruh frame jadi zona
+4. Dashboard aktif dengan live stream + daftar kendaraan real-time; zona bisa diubah lewat "Ubah zona…"
 
 ---
 
@@ -173,18 +173,25 @@ Ultralytics akan otomatis menggunakan GPU jika tersedia.
 
 Bagian ini untuk mesin seperti mini PC Intel Core i5-2400: 4 core, punya AVX tetapi tidak punya AVX2, RAM 8 GB, tanpa GPU. Di mesin sekelas itu satu tick deteksi bisa memakan waktu lebih dari satu detik, sehingga video di dashboard berjalan lebih lambat dari aslinya.
 
-**Tentang angka di bagian ini**
+**Hasil ukur di mini PC sesungguhnya (Core i5-2400S 2,5 GHz, tanpa AVX2, 14-10-2026)**
 
-- Belum ada yang diukur di CPU tanpa AVX2 yang sesungguhnya. Semua angka kecepatan di bawah berasal dari laptop development — sebagian dalam emulasi mini PC (4 core, set instruksi dibatasi sampai AVX) — jadi hanya menunjukkan orde besarannya.
-- **Perkiraan kasar** (bukan hasil ukur) untuk Core i5-2400 dengan konfigurasi default (`best.pt`, `imgsz` 960): sekitar 2–3 detik per tick, atau lebih.
-- Angka yang sebenarnya hanya bisa didapat dengan menjalankan `tools\benchmark_inference.py` di mesin itu sendiri (langkah 2).
+| Model (`imgsz` 960) | median per tick | detik/tick (benchmark) |
+|---|---|---|
+| `best.pt` (PyTorch 2.14, 3 thread) | 1861–1928 ms | 1,98–2,04 |
+| `best.onnx` (ONNX Runtime 1.31) | 1145 ms | 1,26 |
+
+- ONNX Runtime **jalan** di CPU tanpa AVX2 dan 1,7× lebih cepat. Di mesin itu deteksinya identik dengan `best.pt`: 42/42 frame (kelas + kotak), selisih maks 0,0004 px, dan 60/60 tick tracking (id + kelas + kotak) kalau tiap model di proses sendiri.
+- Saat sistem lengkap berjalan (backend + dashboard `?lite` di browser), `proc.tick_ms` ≈ 1,1–1,4 detik dengan `PARKING_TICK_STEP=2` (median 1,35 detik pada `input3.mp4`, 15-10-2026). Backend tidak menunggu antar tick, jadi video di dashboard berjalan sedikit lebih cepat dari aslinya (≈ 1,5×); durasi parkir tetap dihitung dalam detik video.
+- **Dashboard tanpa GPU:** di mesin ini Chrome/Edge menggambar dengan CPU. Animasi terus-menerus + blur di dashboard lama memakan ~70% satu core dan membuat tick naik ke 2,5–3,4 detik. Dashboard sekarang tanpa animasi berulang/blur; buka dengan `?lite` (mis. `http://localhost:4173/?lite`) untuk menolkan sisa gerakan.
+- **Satu klik:** `start_minipc.bat` di root project mengaktifkan venv, men-set `PARKING_VEHICLE_MODEL` (`best.onnx`, atau `best.pt` bila `.onnx` tidak ada; diatur lewat baris `set MODEL_PT=` / `set MODEL_ONNX=` di awal bagian Konfigurasi), `PARKING_TICK_STEP=2`, `YOLO_OFFLINE=true`, `ENABLE_TTS=true`, menjalankan backend dan `npm run preview` di dua jendela, lalu membuka `http://localhost:4173/?lite`. Isi file itu menjelaskan tiap baris.
+- Angka di bawah ini (dari laptop / emulasi) tetap dipertahankan sebagai pembanding orde besaran. Untuk mesin lain, ukur sendiri dengan `tools\benchmark_inference.py` (langkah 2).
 
 ### Ringkasan pilihan
 
 | Pilihan | Mengubah hasil deteksi? | Catatan |
 |---|---|---|
 | `PARKING_TICK_STEP` lebih besar (khusus file video) | Per frame tidak; id / durasi bisa | Deteksi per frame sama, tetapi tracker dan logika parkir melihat frame yang berjarak lebih jauh, jadi logical id / durasi sebagian kendaraan bisa berbeda dari hasil nilai 1. Tick tidak jadi lebih singkat; tiap tick mencakup lebih banyak detik video, jadi ketelitian waktu lebih kasar |
-| Model ONNX lewat ONNX Runtime (`PARKING_VEHICLE_MODEL=best.onnx`) | Tidak | Deteksi identik dengan `best.pt` pada `imgsz` yang sama (100 dari 100 frame uji). Kemungkinan lebih cepat, tetapi belum terbukti bisa jalan di CPU tanpa AVX2 |
+| Model ONNX lewat ONNX Runtime (`PARKING_VEHICLE_MODEL=best.onnx`) | Tidak | Deteksi identik dengan `best.pt` pada `imgsz` yang sama (100 dari 100 frame uji). Terbukti jalan di mini PC tanpa AVX2 dan 1,7× lebih cepat (hasil ukur di atas) |
 | `ENABLE_TTS=false` | Tidak | Kalau tidak ada speaker atau internet |
 | Frontend hasil build (`npm run preview`) | Tidak | Menggantikan dev server Vite |
 | `PARKING_TRACKER=botsort_static.yaml` | Ya, sebagian | Opt-in. Hematnya kecil; logical id / durasi sebagian kendaraan bisa berubah |
@@ -294,7 +301,7 @@ Hitung ulang `PARKING_TICK_STEP` (langkah 3) dari baris `best.onnx`.
 Yang sudah dan belum diketahui:
 
 - Hasil deteksinya identik dengan `best.pt` pada `imgsz` yang sama, di 100 dari 100 frame uji.
-- Dalam emulasi, ONNX Runtime 1,6–2,6× lebih cepat daripada `best.pt`. **Tetapi** set instruksi ONNX Runtime tidak bisa dibatasi dalam emulasi itu, jadi kecepatannya di CPU tanpa AVX2 tidak diketahui, dan belum terbukti bisa jalan di sana.
+- Dalam emulasi, ONNX Runtime 1,6–2,6× lebih cepat daripada `best.pt`. **Tetapi** set instruksi ONNX Runtime tidak bisa dibatasi dalam emulasi itu, jadi kecepatannya di CPU tanpa AVX2 tidak diketahui dari emulasi. Di mini PC sesungguhnya (i5-2400S) sudah diuji: jalan, 1,7× lebih cepat, hasil identik (lihat awal bagian ini).
 - Kalau proses berhenti mendadak tanpa tabel hasil — "Illegal instruction", atau di cmd `echo %ERRORLEVEL%` menampilkan `-1073741795` (kode `0xC000001D`) — ONNX Runtime tidak cocok dengan CPU itu: tetap pakai `best.pt`. Skrip benchmark menyimpan JSON sebelum tiap model diuji, jadi hasil `best.pt` tidak hilang.
 - Export harus dengan `dynamic=True`. Tanpa itu `PARKING_VEHICLE_IMGSZ` diabaikan untuk model hasil export (Ultralytics memakai ukuran saat export).
 
@@ -340,8 +347,12 @@ Arti dan default semua variabel ada di [`backend/README.md`](backend/README.md#e
 | `ModuleNotFoundError: edge_tts` | `pip install edge-tts` |
 | `ModuleNotFoundError: No module named 'lap'` | Environment dibuat sebelum `lap` masuk `requirements.txt` → jalankan ulang `pip install -r requirements.txt` |
 | `pygame.error: No such device` | TTS akan skip jika tidak ada audio device |
+| `[TTS] Sintesis suara gagal (WSServerHandshakeError: 403 ...)` | Versi edge-tts lama ditolak server suara Microsoft (7.2.8 selalu 403, 7.3.1 jalan). Jalankan ulang `pip install -r requirements.txt` — sekarang meminta edge-tts ≥ 7.3.1 |
+| `[TTS] Sintesis suara gagal (ClientConnectorDNSError ... getaddrinfo failed)` | Internet sedang putus. Deteksi tetap jalan; TTS mencoba lagi sendiri. Kalimat yang audionya pernah dibuat (di `outputs\tts_temp`) tetap bisa diputar offline |
+| Deteksi/stream membeku setelah jendela backend diklik | QuickEdit konsol Windows menahan `print()`. `start_minipc.bat` mematikannya khusus jendela backend (`tools\disable_quickedit.py`); kalau menjalankan uvicorn manual, tekan Esc di jendela itu |
 | Stream MJPEG lambat | Gambar di stream berganti sekali per tick. Untuk file video 1 tick = `PARKING_TICK_STEP` detik video (default 1), jadi sekitar satu gambar per detik itu normal. Kalau lebih lambat dari itu, satu tick memakan waktu lebih lama dari jatahnya: cek `proc.tick_ms` di `http://localhost:8000/status`, lalu ikuti [bagian 7](#7-menjalankan-di-pc-lambat-cpu-lama-tanpa-avx2) |
-| `Processor berhenti: Sumber tidak bisa dibuka: ...` atau `Frame pertama tidak bisa dibaca: ...` (di log backend, banner dashboard, dan `proc.error`) | Cek path video dan pastikan file tidak corrupt; untuk kamera coba index lain. Sumber yang gagal tidak dicoba ulang sendiri — ulangi dari wizard (tombol **Ganti Setup**) |
+| `Processor berhenti: Sumber tidak bisa dibuka: ...` atau `Frame pertama tidak bisa dibaca: ...` (di log backend, banner dashboard, dan `proc.error`) | Cek path video dan pastikan file tidak corrupt; untuk kamera coba index lain. Sumber yang gagal tidak dicoba ulang sendiri — ulangi dari wizard (tombol **Ganti sumber…**) |
+| Upload video lambat saat **Ganti sumber…** | Dashboard sekarang tidak mengunggah ulang video yang isinya sudah ada di folder `uploads` (langkah 2 menulis "Video yang sama sudah ada di server deteksi"), mengirim file langsung ke disk (`PUT /upload/stream`), dan deteksi file video ditunda selama unggahan (`proc.state` = `paused`). Kalau masih lambat, pastikan dashboard hasil build baru (`npm run build`) dan buka lewat `http://localhost:4173`: dari alamat IP LAN pemeriksaan "sudah ada" dilewati karena browser tidak menyediakan `crypto.subtle` di sana. Detail: `backend/README.md` bagian Upload video |
 | Camera tidak terdeteksi | Coba index 0, 1, 2 — cek device manager. Di Docker Desktop Windows/Mac kamera tidak bisa diteruskan ke container (lihat `docker/README.md`) |
 | Deteksi tidak jalan | Buka `http://localhost:8000/status` dan lihat `proc.state` / `proc.error`, lalu cek log terminal backend. Kalau `proc.state` = `running` dan `proc.tick` terus bertambah, deteksi berjalan tetapi lambat → [bagian 7](#7-menjalankan-di-pc-lambat-cpu-lama-tanpa-avx2) |
 | Port 8000 sudah dipakai | `uvicorn backend.main:app --port 8001`, lalu jalankan frontend dengan `VITE_API_BASE=http://localhost:8001` (lihat `parking-dashboard/README.md`) |

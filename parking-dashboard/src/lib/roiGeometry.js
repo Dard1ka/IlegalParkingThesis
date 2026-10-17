@@ -44,6 +44,34 @@ export function clientToNormalized(clientX, clientY, boxRect, imgW, imgH) {
 }
 
 /**
+ * Posisi kursor → piksel VIDEO di bawahnya (bilangan bulat 0..imgW-1,
+ * 0..imgH-1). imgW/imgH harus ukuran asli frame (= ukuran video, karena
+ * /first_frame dikirim dalam resolusi asli). `inside` = false kalau kursor
+ * ada di bar hitam / di luar gambar; x/y lalu ditarik ke tepi terdekat.
+ */
+export function clientToVideoPixel(clientX, clientY, boxRect, imgW, imgH) {
+  const img = getImageRect(boxRect.width, boxRect.height, imgW, imgH)
+  if (!img) return null
+  const fx = (clientX - boxRect.left - img.x) / img.w
+  const fy = (clientY - boxRect.top  - img.y) / img.h
+  return {
+    x: Math.min(imgW - 1, Math.max(0, Math.floor(fx * imgW))),
+    y: Math.min(imgH - 1, Math.max(0, Math.floor(fy * imgH))),
+    inside: fx >= 0 && fx < 1 && fy >= 0 && fy < 1,
+  }
+}
+
+/**
+ * Piksel video → titik ternormalisasi di PUSAT piksel itu. Backend
+ * (processor._decode_roi) menghitung int(x * W), dan int(((px + 0.5) / W) * W)
+ * = px, jadi titik yang disimpan jatuh tepat di piksel yang diklik — termasuk
+ * piksel paling kanan/bawah (tidak pernah W / H, satu piksel di luar frame).
+ */
+export function videoPixelToNormalized(px, py, imgW, imgH) {
+  return { x: (px + 0.5) / imgW, y: (py + 0.5) / imgH }
+}
+
+/**
  * Titik ternormalisasi → piksel canvas, untuk menggambar polygon.
  * `imgRect` = hasil getImageRect() memakai ukuran buffer canvas.
  */

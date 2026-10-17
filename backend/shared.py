@@ -58,12 +58,16 @@ class SharedState:
         self._running: bool = False   # thread processor hidup?
 
         # state   : loading_models | waiting_source | opening_source |
-        #           waiting_roi | running | error | stopped
+        #           waiting_roi | running | paused | error | stopped
         # tick    : jumlah tick yang sudah selesai untuk sumber saat ini
         # tick_ms : lama tick terakhir (milidetik jam nyata), None bila belum ada
         # error   : pesan singkat bila state == "error" (atau thread berhenti
         #           karena error), selain itu None
         self._proc: Dict = _fresh_proc("stopped")
+
+        # ── Unggahan video yang sedang berjalan (PUT /upload/stream) ──
+        # Selama > 0, processor menunda tick sumber file video (state "paused")
+        self._uploads_active: int = 0
 
     # ── Frame ─────────────────────────────────────────────────
     def set_frame(self, jpeg: bytes) -> None:
@@ -177,6 +181,19 @@ class SharedState:
     def is_running(self) -> bool:
         with self._lock:
             return self._running
+
+    # ── Unggahan video ────────────────────────────────────────
+    def begin_upload(self) -> None:
+        with self._lock:
+            self._uploads_active += 1
+
+    def end_upload(self) -> None:
+        with self._lock:
+            self._uploads_active = max(0, self._uploads_active - 1)
+
+    def upload_active(self) -> bool:
+        with self._lock:
+            return self._uploads_active > 0
 
     # ── Status processor ("proc") ─────────────────────────────
     def set_proc_state(self, state: str, error: Optional[str] = None) -> None:

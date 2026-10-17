@@ -72,7 +72,7 @@ backend/
 Bertanggung jawab untuk:
 
 - **Lifecycle management**: Menjalankan VideoProcessor di background thread saat startup, menghentikannya saat shutdown.
-- **File upload**: Menerima video file dari frontend, menyimpan ke `uploads/`.
+- **File upload**: Menerima video file dari frontend, menyimpan ke `uploads/` (lihat [Upload video](#upload-video)).
 - **Konfigurasi**: Menerima pilihan sumber video (file/kamera) dan mode ROI (manual/auto).
 - **MJPEG streaming**: Men-generate multipart JPEG stream dari SharedState.
 - **WebSocket broadcasting**: Mengirim data alert + statistik + status processor (`proc`) ke semua client setiap 1 detik.
@@ -82,7 +82,9 @@ Bertanggung jawab untuk:
 
 | Method | Path | Fungsi |
 |---|---|---|
-| `POST` | `/upload` | Upload file video (MP4, AVI, MOV, MKV, WebM) |
+| `GET` | `/upload/check?size=&sample=` | Cari video yang isinya sama di `uploads/`; `{"found": true, "path", "filename"}` kalau ada |
+| `PUT` | `/upload/stream?filename=` | Upload file video (MP4, AVI, MOV, MKV, WebM); body = isi file, langsung ditulis ke `uploads/`. Dipakai dashboard |
+| `POST` | `/upload` | Upload file video lewat multipart (cara lama, tetap tersedia) |
 | `POST` | `/configure` | Set sumber video + mode ROI |
 | `GET` | `/first_frame` | Frame pertama sumber yang baru dikonfigurasi sebagai JPEG (untuk drawing ROI); `204` selama frame itu belum tersedia |
 | `POST` | `/set_roi` | Terima koordinat polygon zona larangan parkir |
@@ -117,8 +119,20 @@ Bertanggung jawab untuk:
 | `opening_source` | Sedang membuka file video / kamera |
 | `waiting_roi` | Sumber sudah terbuka, menunggu zona dari `POST /set_roi` |
 | `running` | Deteksi berjalan |
+| `paused` | Tick file video ditunda selama video baru diunggah lewat `PUT /upload/stream`; lanjut sendiri setelah unggahan selesai |
 | `error` | Processor gagal — penyebabnya ada di field `error` |
 | `stopped` | Processor dihentikan |
+
+#### Upload video
+
+Dashboard mengganti sumber video dengan dua langkah:
+
+1. **`GET /upload/check`**: dashboard menghitung "sidik" video yang dipilih, yaitu SHA-256 atas tiga potongan 1 MiB (awal, tengah, akhir; file ≤ 3 MiB di-hash utuh), lalu menanyakan ke server. Kalau `uploads/` sudah berisi video dengan ukuran dan sidik yang sama (mis. `input3.mp4` dipilih lagi), video itu langsung dipakai tanpa diunggah ulang. Pemeriksaan ini butuh `crypto.subtle` di browser, yang hanya ada di konteks aman: `http://localhost` ya, alamat IP LAN tidak. Tanpa itu dashboard langsung mengunggah.
+2. **`PUT /upload/stream`**: isi file dikirim apa adanya (bukan multipart) dan ditulis langsung ke `uploads/`, tanpa file sementara di `%TEMP%` dan tanpa salinan kedua. Selama unggahan dari browser **di komputer ini** berjalan, processor menunda tick sumber **file video** (`proc.state` = `paused`) supaya CPU dipakai unggahan; frame, urutan, dan detik video tiap tick tetap sama, jadi hasil deteksi tidak berubah. Sumber **kamera** tidak ditunda (cara menghitung waktu mode kamera tetap), begitu juga unggahan dari perangkat lain di jaringan (kecepatannya dibatasi jaringan, bukan CPU). Unggahan yang putus, tidak lengkap, atau berhenti mengirim data 60 detik dibuang.
+
+Aturan penyimpanan (berlaku juga untuk `POST /upload`): file di `uploads/` tidak pernah ditimpa. Video dengan isi sama tidak disimpan dua kali; nama yang sudah dipakai video lain disimpan sebagai `nama-2.mp4`, `nama-3.mp4`, dst. Nama file dibersihkan (folder, `..`, dan karakter yang dilarang Windows dibuang). Selama ditulis, unggahan bernama `uploads/.<32 huruf hex>.part`; kalau backend dimatikan paksa di tengah unggahan, sisa file itu dihapus saat backend dijalankan lagi (hanya nama dengan pola persis itu). Disk penuh atau file dikunci dijawab sebagai pesan galat, bukan "server tidak merespons".
+
+Diukur di mini PC (564 MB, deteksi `input3.mp4` sedang berjalan): multipart lama 10 detik (4 detik di antaranya menyalin ulang setelah progres 100 %), `PUT /upload/stream` 5,1 detik, video yang sudah ada di server ±0,4 detik.
 
 ### `processor.py` — VideoProcessor
 
@@ -140,10 +154,13 @@ Inti dari sistem deteksi. Menjalankan pipeline berikut pada setiap tick (file vi
 
 | Fitur | Deskripsi |
 |---|---|
-| Re-linking | Ketika tracker kehilangan ID, sistem mencocokkan deteksi baru ke record lama berdasarkan IoU, jarak, dan durasi parkir (kelas kendaraan dan zona harus sama). Warna tidak dipakai untuk pencocokan — hanya untuk label dashboard dan teks peringatan suara |
-| Occlusion TTL | Kendaraan tersembunyi tetap dilacak hingga 80 detik |
-| Color classification | HSV-based, 12 kategori warna, tanpa ML tambahan. Dijalankan saat kendaraan pertama kali terlihat, lalu sekali lagi saat kendaraan mulai dianggap parkir (bukan menunggu 300 detik) |
-| TTS | Edge-TTS (`id-ID-GadisNeural`), non-blocking via thread terpisah |
+| Re-linking | Ketika tracker kehilangan ID, sistem mencocokkan deteksi baru ke record lama berdasarkan IoU, jarak, dan durasi parkir (zona harus sama). Kelas car/truck/bus boleh tertukar asalkan kotaknya bertumpuk IoU ≥ 0,60 (`CROSS_CLASS_IOU`); motor tidak pernah dicocokkan ke kendaraan roda empat. Label jenis kendaraan diambil dari suara terbanyak (`cls_votes`). Warna tidak dipakai untuk pencocokan — hanya untuk label dashboard dan teks peringatan suara |
+| Kotak ganda & ID switch | Dalam satu tick, kotak beda kelas yang bertumpuk IoU ≥ 0,70 (`DEDUPE_IOU`) dianggap satu kendaraan (hanya daftar logika; output YOLO tidak diubah). Penugasan dua tahap: deteksi yang ID tracker-nya sudah terhubung diproses dulu, sehingga ID switch pada kendaraan yang masih terlihat tidak membuat LID baru |
+| Kotak loncat | Kotak kendaraan yang sudah parkir tidak ikut berpindah kalau deteksi meluber keluar kotak parkirnya (> 30 % luas dan > 1500 px², `spills_outside`), mis. saat kendaraan lain lewat di depannya; record dan timernya tetap |
+| Occlusion TTL | Kendaraan yang sudah parkir ≥ 20 detik saat menghilang tetap dilacak hingga 80 detik dengan durasi penuh (seperti semula). Record yang belum parkir atau baru parkir < 20 detik dibuang setelah tersembunyi 20 detik (`GHOST_TTL_SECONDS`), supaya "record hantu" tidak menumpuk. Cara menghitung durasi parkir tidak berubah |
+| Cek segitiga | Sekali saat durasi parkir mencapai 60 detik, pada potongan dari kotak saat kendaraan mulai parkir (`parked_bbox`) diperluas 18 %, bukan kotak deteksi sesaat yang bisa bergeser |
+| Color classification | HSV-based, 12 kategori warna, tanpa ML tambahan. Hanya pita bodi kendaraan yang dinilai (kaca, atap, ban, aspal, dan tepi kotak dibuang). Satu suara saat kendaraan pertama terlihat, lalu diulang dari nol saat mulai dianggap parkir: mayoritas 5 tick terlihat pertama, lalu tetap. Tick yang kotaknya dibekukan / bergeser dari kotak parkir dilewati |
+| TTS | Edge-TTS (`id-ID-GadisNeural`), non-blocking via thread terpisah. **Semua** pelanggar yang terlihat disebut dalam SATU kalimat, urut dari yang paling dulu parkir, mis. "Mohon untuk mobil berwarna hitam dan truk berwarna biru untuk tidak parkir di situ atau akan terkena denda karena bukan tempat parkir." Jenis + warna yang sama digabung ("dua mobil berwarna hitam"); warna yang belum diketahui = jenisnya saja. Kalimat diucapkan bila ada pelanggar yang sudah 20 detik (`TTS_REPEAT_GAP`) tidak disebut, atau ada pelanggar baru; pesan antrean yang sudah basi diganti daftar terbaru |
 | Auto-loop video | Video file otomatis loop dari awal saat selesai |
 | Live reconfigure | Frontend bisa mengganti source/ROI tanpa restart processor |
 
@@ -162,6 +179,7 @@ State container thread-safe dengan `threading.Lock`. Menyimpan:
 | `_source_pending` | `Dict` | Konfigurasi sumber baru (belum diambil processor) |
 | `_roi_mode` | `str` | `"manual"` atau `"auto"` |
 | `_running` | `bool` | Apakah processor sedang aktif |
+| `_uploads_active` | `int` | Jumlah `PUT /upload/stream` yang sedang berjalan; selama > 0 tick file video ditunda |
 
 Pola komunikasi menggunakan **take pattern**: processor memanggil `take_roi()` / `take_source()` yang mengembalikan nilai pending lalu me-reset ke `None`, memastikan setiap perubahan hanya diproses sekali.
 
@@ -222,7 +240,7 @@ Semua konfigurasi di bawah dibaca **satu kali saat backend start** — setelah m
 Catatan:
 
 - Path relatif (`best.pt`, `triangle.pt`, file YAML tracker buatan sendiri) dihitung dari folder tempat backend dijalankan, yaitu root project. Pengecualian: nama `botsort_static.yaml` selalu berarti file bawaan `backend/botsort_static.yaml`, dari folder mana pun backend dijalankan; `botsort.yaml` dan `bytetrack.yaml` adalah file bawaan Ultralytics.
-- Kalau dashboard dibuka dari perangkat lain di jaringan (mis. `http://192.168.1.20:5173`), origin itu harus ditambahkan ke `PARKING_CORS_ORIGINS`. Tanpa itu pemanggilan API dari wizard (`/upload`, `/configure`, `/first_frame`, `/set_roi`) diblokir browser.
+- Kalau dashboard dibuka dari perangkat lain di jaringan (mis. `http://192.168.1.20:5173`), origin itu harus ditambahkan ke `PARKING_CORS_ORIGINS`. Tanpa itu pemanggilan API dari wizard (`/upload/check`, `/upload/stream`, `/configure`, `/first_frame`, `/set_roi`) diblokir browser.
 - **Model hasil export** bersifat opsional dan butuh paket yang tidak dipasang `requirements.txt` (dan tidak ada di image Docker):
   - `best.onnx` butuh `onnxruntime` dan `onnx`. Hasil deteksinya identik dengan `best.pt` pada `imgsz` yang sama, tetapi belum terbukti bisa jalan di CPU tanpa AVX2 — uji dulu di mesin target dengan `tools/benchmark_inference.py`. Export harus dengan `dynamic=True`; kalau tidak, `PARKING_VEHICLE_IMGSZ` diabaikan (Ultralytics memakai ukuran saat export).
   - OpenVINO (folder `best_openvino_model`, paket `openvino`) hanya untuk CPU **dengan** AVX2. Jangan dipakai di CPU lama tanpa AVX2 seperti Core i5-2400.

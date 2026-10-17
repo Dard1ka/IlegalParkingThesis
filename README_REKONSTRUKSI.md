@@ -1,38 +1,43 @@
-# Iterasi 2 — Raspberry Pi 4 Model B (REKONSTRUKSI)
+# Iterasi 4 — Mini PC, perbaikan sebelum fine-tune (REKONSTRUKSI)
 
-**Ini bukan file asli dari Raspberry Pi.** File asli di kartu SD Pi (`~/Illegal_Parking`) tidak pernah
-disalin balik ke laptop dan kartu SD-nya sudah tidak ada. Paket ini disusun ulang pada 10-11-2026 dari:
+**Ini bukan salinan asli dari satu titik waktu.** Tidak ada arsip yang menyimpan keadaan iterasi 4 secara
+terpisah: semua salinan yang sudah berisi perbaikan iterasi 4 juga sudah memakai model fine-tune
+`best_ft1` (iterasi 5), dan semua salinan dengan model lama `best.pt` belum berisi perbaikan itu.
+Paket ini disusun ulang pada 10-11-2026 dari `Thesis_sistem_lengkap_20261110.zip` (sistem akhir, iterasi 5)
+dengan **mengembalikan model kendaraan ke `best.pt`**, sesuai keputusan pengguna.
 
-- `Thesis Raspberry Pi.zip` (kode yang disalin ke Pi, 16-08-2026), dan
-- log sesi Claude Code di laptop `b3cbe55e-e13c-40a9-822e-e5b6a23f442d.jsonl` (16-18 Agustus 2026), yang
-  memuat perintah dan potongan kode yang benar-benar ditempel dan dijalankan di Pi.
+## Isi iterasi 4 (dikerjakan di mini PC i5-2400S, 15-25 Oktober 2026)
 
-## Kondisi akhir yang direkonstruksi (17-08-2026, ±19.53 UTC)
+Sumber: `HANDOVER_PENGEMBANGAN.md` dan `PERUBAHAN_IMPLEMENTASI_BAB4.md` (paket mini PC 1-11-2026).
 
-| Perubahan di Pi | Lokasi di paket ini | Bukti di log |
+| Aspek | Perbaikan | Waktu |
 |---|---|---|
-| Video terbalik 180° → helper `_read_rot()` (cv2.rotate) menggantikan semua `cap.read()` | `backend/processor.py` (helper di bawah `from .shared import SharedState` + 6 pemanggilan) | L587 (patch pertama, rekursi), L600/L606 (patch ulang yang dijalankan), L613 (grep baris 33, 619, 656, 677, 1019, 1035, 1039) |
-| Ukuran input YOLO diturunkan: `VEHICLE_IMGSZ` 960 → 320, `TRIANGLE_IMGSZ` 640 → 320 | `backend/processor.py` (blok CONFIG) | L626 (sed imgsz 320), L639 (imgsz tetap 320) |
-| Percobaan model NCNN (`best_ncnn_model`, `triangle_ncnn_model`) → *segmentation fault* → kembali ke `.pt` | `catatan_pi/processor_langkah_ncnn320.py` (keadaan sementara) | L626 (sed ke NCNN), L635 "balikkan ke pt saja karena segmentation fault", L639 (sed kembali ke best.pt) |
-| `import torch` gagal (`undefined symbol: sbgemm_`) → backend dijalankan dengan `LD_PRELOAD` OpenBLAS milik torch | `catatan_pi/run_backend_pi.sh` | L468-L506 ("oke backend nya kebuka") |
-| apt macet (IPv6), pemulihan upgrade, paket sistem, venv, export NCNN, Node/npm | `catatan_pi/setup_pi_commands.sh` | L251-L532 |
-| Cadangan sebelum patch (`cp processor.py processor.py.bak`) | `backend/processor.py.bak` (= kode iterasi 1) | L587/L606 |
+| Pengelolaan record kendaraan | Satu kendaraan dua ID (`dedupe_tracked_boxes`), kelas car/truck bergantian (`class_compatible` + label voting), kotak parkir loncat ke kendaraan lewat (`spills_outside`), record hantu (`hidden_ttl_seconds`) | 15 Okt |
+| Klasifikasi warna | Algoritma HSV baru + voting 5 suara sejak kendaraan mulai parkir (`vote_vehicle_color`) | 15 Okt |
+| Tampilan dashboard | Redesain "Rambu Menyala": tanpa animasi/blur (browser mini PC tanpa GPU), tema ikut Windows, mode `?lite` | 15 Okt |
+| Unggah video | Cek sidik file (`/upload/check`) + unggah streaming (`/upload/stream`), tick ditunda saat mengunggah | 16 Okt |
+| Peringatan suara | Satu kalimat untuk semua pelanggar yang terlihat | 25 Okt |
 
-Nomor L = baris (mulai 1) di file log JSONL di atas. Selain `backend/processor.py`,
-`backend/processor.py.bak`, dan folder `catatan_pi/`, semua file sama persis dengan `Thesis Raspberry Pi.zip`.
+## Yang diubah dari sistem akhir (iterasi 5)
 
-## Yang TIDAK bisa dipulihkan
+| File | Sistem akhir | Paket ini |
+|---|---|---|
+| `backend/processor.py` baris 102 | default `"best_ft1.pt"` | default `"best.pt"` (sama dengan kode iterasi 3) |
+| `start_minipc.bat` baris 20-25 | `MODEL_PT=best_ft1.pt`, `MODEL_ONNX=best_ft1.onnx` | `MODEL_PT=best.pt`, `MODEL_ONNX=best.onnx` |
+| `SETUP.md` baris 186 | menyebut `best_ft1.onnx` | menyebut `best.onnx` |
+| Model | `best_ft1.pt`, `best_ft1.onnx` | `best.pt` (YOLO11m, 12-04-2026; md5 97384f70...) |
+| `PANDUAN_REMODEL_UI.md` | ada (paket remodel UI 10-11-2026) | dihapus (bukan bagian iterasi) |
 
-- Folder model hasil export NCNN (`best_ncnn_model/`, `triangle_ncnn_model/`).
-- Path `.so` OpenBLAS persis yang dipakai `LD_PRELOAD` (perintah pencariannya ada, hasilnya tidak tercatat).
-- `package.json`/lock frontend versi Pi (log menunjukkan Pi menjalankan Vite 8.2.1).
-- Perubahan di Pi setelah 17-08-2026, dan **angka kecepatan nyata** (tidak pernah diukur/dicatat).
-  Saran imgsz 416/256 di log (L639, L693) tidak tercatat dijalankan, jadi tidak dimasukkan.
+Semua file lain sama persis dengan `Thesis_sistem_lengkap_20261110.zip`.
 
-## Perangkat dan cara menjalankan (di Pi)
+## Catatan
 
-Raspberry Pi 4 Model B 4 GB, Raspberry Pi OS Trixie (Debian 13, Python 3.13), proyek di `~/Illegal_Parking`,
-venv `~/Illegal_Parking/parking`. Lihat `catatan_pi/setup_pi_commands.sh` lalu `catatan_pi/run_backend_pi.sh`.
-
-**Jangan jalankan paket ini di laptop/mini PC x86 tanpa mengubah `ROTATE_180 = False`:** di x86, OpenCV sudah
-menerapkan metadata orientasi video, sehingga rotasi tambahan justru membuat video terbalik.
+- `best.onnx` tidak disertakan (sesuai keputusan pengguna). `start_minipc.bat` otomatis memakai `best.pt`
+  bila `best.onnx` tidak ada; di mini PC ini lebih lambat (benchmark 14-10-2026: `.pt` ±1,93 dtk vs `.onnx`
+  ±1,14 dtk per inferensi, deteksi identik). Untuk membuat `best.onnx`:
+  `pip install onnxruntime onnx==1.18.0` lalu
+  `python -c "from ultralytics import YOLO; YOLO('best.pt').export(format='onnx', dynamic=True, imgsz=960, simplify=False)"`.
+- Karena perubahan TTS satu kalimat dibuat pada hari yang sama dengan penggantian model (25-10-2026), paket
+  ini memuat TTS satu kalimat sebagai bagian "peringatan suara" iterasi 4.
+- Dua masalah yang disebut di iterasi 3 (video unggahan tetap tersimpan di `uploads/`, model sudah dimuat saat
+  backend start sebelum ada video) **masih ada** di paket ini, sama seperti di sistem akhir.

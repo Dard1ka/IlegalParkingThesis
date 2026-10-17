@@ -11,7 +11,9 @@
 #                         uvicorn 0.44.0, pydantic 2.13.2, lap 0.5.13
 #   mini PC (fresh pip) : torch 2.14.1, ultralytics 8.4.174, numpy 2.4.6,
 #                         opencv-python 5.0.0.93, fastapi 0.143.0,
-#                         uvicorn 0.54.0, pydantic 2.14.0
+#                         uvicorn 0.54.0, pydantic 2.14.0, lap 0.5.13,
+#                         edge-tts 7.3.1 (+ optional onnxruntime 1.31.0,
+#                         onnx 1.18.0 for best.onnx)
 # best.pt was trained with ultralytics 8.4.36.
 # ══════════════════════════════════════════════════════════════
 
@@ -33,7 +35,9 @@ torch>=2.0.0,<3
 lap>=0.5.12,<1
 
 # ── Audio / TTS ───────────────────────────────────────────────
-edge-tts>=6.1.9,<8          # Microsoft Edge TTS (Indonesian voice)
+# Microsoft Edge TTS (Indonesian voice). The speech server rejects older
+# clients: 7.2.8 got HTTP 403 on every sentence (mini PC, Oct 2026), 7.3.1 works.
+edge-tts>=7.3.1,<8
 pygame>=2.5.2,<3            # Audio playback
 
 # ── Web Backend (dashboard mode) ─────────────────────────────

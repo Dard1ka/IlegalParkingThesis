@@ -57,7 +57,8 @@
 │  └──────┬──────┘  └──────┬───────┘  └────────┬─────────┘   │
 └─────────┼────────────────┼───────────────────┼─────────────┘
           │ POST /configure │ GET /video_feed   │ WS /ws/alerts
-          │ POST /upload    │                   │
+          │ GET /upload/check                   │
+          │ PUT /upload/stream                  │
           │ POST /set_roi   │                   │
           ▼                 ▼                   ▼
 ┌─────────────────────────────────────────────────────────────┐
@@ -85,13 +86,13 @@
 
 ```
 Frame → YOLO Track → Filter by ROI → Assignment Logic
-     → Color Classify (first time the vehicle is seen)
-     → Stationary Check (3s) → Parked State → Color Classify (once more)
-     → 60s: Triangle Check → Warning
+     → Color Vote (1 suara saat pertama terlihat)
+     → Stationary Check (3s) → Parked State → Color Vote (5 tick terlihat pertama sejak parkir, lalu tetap)
+     → 60s: Triangle Check (potongan dari kotak saat mulai parkir) → Warning
      → 300s: TTS Alert → Violation
 ```
 
-Warna diklasifikasi saat kendaraan pertama kali terlihat dan sekali lagi saat kendaraan mulai dianggap parkir, jadi label warna sudah tampil di dashboard jauh sebelum ambang 300 detik.
+Warna diambil sekali saat kendaraan pertama kali terlihat, lalu diulang dari nol saat kendaraan mulai dianggap parkir: mayoritas 5 tick terlihat pertama (file video step 2: durasi 4–12 s; kamera: 3–7 s), lalu tetap. Tick yang kotaknya dibekukan atau bergeser dari kotak parkir (IoU < 0,6) dilewati. Label warna sudah tampil di dashboard jauh sebelum ambang 300 detik.
 
 ---
 
@@ -214,7 +215,9 @@ illegal-parking-detection/
 
 | Method | Endpoint | Description |
 |---|---|---|
-| `POST` | `/upload` | Upload video file (MP4, AVI, MOV, MKV, WebM) |
+| `GET` | `/upload/check` | Find an identical video already in `uploads/` (size + sample hash), so it is not uploaded again |
+| `PUT` | `/upload/stream` | Upload video file (MP4, AVI, MOV, MKV, WebM) as the raw request body, written straight to `uploads/`; file-video detection pauses while it runs |
+| `POST` | `/upload` | Upload video file via multipart (older path, still available) |
 | `POST` | `/configure` | Set source (video/camera) and ROI mode (manual/auto) |
 | `GET` | `/first_frame` | Get first frame of the newly configured source as JPEG for ROI drawing (`204` until it is ready) |
 | `POST` | `/set_roi` | Set multi-polygon no-parking zones |
@@ -322,14 +325,21 @@ When a tracked vehicle gets a new ID from BotSORT (e.g., after partial occlusion
 3. **Score function**: `IoU × 500 − center_dist × 1.2 − foot_dist × 2.2 + parked_duration × 8`
 
 ### Color Classification
-HSV-based pixel voting without ML overhead:
-- Resize crop to 96×96
-- Filter low-value pixels (shadow/dark)
-- Classify each pixel into 12 color buckets
-- Return majority color + confidence %
+HSV-based, without ML overhead:
+- Only the body band of the box is used (top 30 % windows/roof, bottom 30 % tyres/shadow/road, and 15 % on each side are dropped)
+- Achromatic pixels are split by brightness into white / gray (silver) / black; chromatic pixels vote by hue bin
+- The label is the majority over the first 5 visible ticks after the vehicle parks, then fixed (12 colours + "unknown", same vocabulary as before)
+- Ticks whose box is frozen or shifted away from the parked box are skipped
+- Measured on 135 sample crops from input1-4: 130 correct (old method: 101)
 
 ### Occlusion Handling
-Vehicles hidden for up to 80 seconds maintain their full state (`ParkedRecord`) including parking duration, triangle status, and color. When they reappear, a grace period of 4 seconds prevents false motion resets.
+Vehicles that had been parked for at least 20 seconds when they disappear keep their full state (`ParkedRecord`) for up to 80 seconds, including parking duration, triangle status, and color. Records that were not yet parked (or parked under 20 seconds) are dropped after 20 seconds hidden, so short-lived "ghost" records no longer pile up. Parking duration is computed exactly as before. When a vehicle reappears, a grace period of 4 seconds prevents false motion resets.
+
+### Duplicate IDs and Jumping Boxes
+- Overlapping boxes of different classes in the same tick (IoU ≥ 0.70) are treated as one vehicle in the record logic (YOLO output is unchanged)
+- car / truck / bus may relink across classes when IoU ≥ 0.60; the label is the majority class
+- A parked vehicle's box does not follow a detection that spills outside its parked box (e.g. a car passing in front)
+- Verified with `tools\replay_harness.py` + `tools\compare_runs.py` on input1-4: the 8 parked vehicles keep identical warning / violation / safe times; LIDs input1 19→12, input4 7→4
 
 ---
 

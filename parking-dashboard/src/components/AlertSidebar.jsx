@@ -1,231 +1,245 @@
-// ─── Status config ────────────────────────────────────────────
-const STATUS = {
-  violation: {
-    label:  'Pelanggaran',
-    emoji:  '🚨',
-    color:  'var(--red)',
-    bg:     'rgba(248,113,113,0.06)',
-    border: 'rgba(248,113,113,0.2)',
-    strip:  'var(--red)',
-    pulse:  true,
-  },
-  warning: {
-    label:  'Peringatan',
-    emoji:  '⚠️',
-    color:  'var(--amber)',
-    bg:     'rgba(251,191,36,0.05)',
-    border: 'rgba(251,191,36,0.18)',
-    strip:  'var(--amber)',
-    pulse:  false,
-  },
-  safe: {
-    label:  'Aman',
-    emoji:  '✅',
-    color:  'var(--green)',
-    bg:     'rgba(74,222,128,0.05)',
-    border: 'rgba(74,222,128,0.18)',
-    strip:  'var(--green)',
-    pulse:  false,
-  },
-  monitoring: {
-    label:  'Memantau',
-    emoji:  '👁',
-    color:  'var(--text-dim)',
-    bg:     'rgba(255,255,255,0.02)',
-    border: 'var(--edge)',
-    strip:  'var(--edge-bright)',
-    pulse:  false,
-  },
-}
+/**
+ * AlertSidebar.jsx
+ * ─────────────────────────────────────────────────────────────
+ * Daftar kendaraan yang berhenti di zona, satu baris per kendaraan dengan
+ * lajur waktu 0–6 menit (garis 1 mnt dan 5 mnt menyambung lurus di semua baris).
+ *
+ * Props:
+ *   alerts      data dari useAlerts()
+ *   multiZone   tampilkan "Zona n" hanya kalau zonanya lebih dari satu
+ *   connected   status WebSocket
+ *   staleSince  kapan koneksi putus (Date), null kalau tersambung
+ */
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { StatusGlyph } from './Glyphs'
+import RuleLane, { LANE, lanePct } from './RuleLane'
 
-const VEHICLE_ICON  = { car: '🚗', truck: '🚛', bus: '🚌', motorcycle: '🏍️', motor: '🏍️' }
+// Nama kelas ditulis utuh (bukan `is-${status}`): Tailwind hanya menyimpan
+// kelas yang ditemukan lengkap di sumber.
+const ROW_CLASS = {
+  monitoring: 'vrow is-monitoring',
+  warning:    'vrow is-warning',
+  violation:  'vrow is-violation',
+  safe:       'vrow is-safe',
+}
+const STATUS_WORD = { monitoring: 'Memantau', warning: 'Peringatan', violation: 'Pelanggaran', safe: 'Aman' }
+const KNOWN_STATUS = new Set(Object.keys(ROW_CLASS))
+const STATUS_ORDER = { violation: 0, warning: 1, monitoring: 2, safe: 3 }
+// Hitungan selain pelanggaran di kalimat ringkasan, urut seperti daftar
+const SUMMARY_PARTS = [['warning', 'peringatan'], ['monitoring', 'memantau'], ['safe', 'aman']]
+
+// Sama dengan bahasa_label / warna_label di backend/processor.py, supaya teks
+// di daftar cocok dengan suara peringatan. Warna "Unknown" tidak ditulis.
 const VEHICLE_LABEL = { car: 'Mobil', truck: 'Truk', bus: 'Bus', motorcycle: 'Motor', motor: 'Motor' }
-
-const COLOR_MAP = {
-  black: '#374151', white: '#f9fafb', gray: '#9ca3af', red: '#f87171',
-  orange: '#fb923c', yellow: '#facc15', brown: '#92400e', green: '#4ade80',
-  cyan: '#22d3ee', blue: '#60a5fa', purple: '#a78bfa', pink: '#f472b6',
+const COLOR_LABEL = {
+  black: 'hitam', white: 'putih', gray: 'abu-abu', red: 'merah',
+  orange: 'oranye', yellow: 'kuning', brown: 'cokelat', green: 'hijau',
+  cyan: 'biru muda', blue: 'biru', purple: 'ungu', pink: 'pink',
 }
 
-function fmt(s) {
-  if (s >= 3600) return `${Math.floor(s/3600)}j ${Math.floor((s%3600)/60)}m`
-  if (s >= 60) return `${Math.floor(s/60)}m ${s%60}s`
-  return `${s}s`
+const HOUR_S = 3600
+const NO_ALERTS = []   // default tetap: array baru tiap render akan memicu useMemo terus
+
+const pad2 = (n) => String(n).padStart(2, '0')
+
+// Durasi pakai titik dua (3:48, 1:02:05); jam dinding pakai titik (21.26.14)
+function fmtDuration(s) {
+  const h = Math.floor(s / HOUR_S)
+  const m = Math.floor((s % HOUR_S) / 60)
+  return h > 0 ? `${h}:${pad2(m)}:${pad2(s % 60)}` : `${m}:${pad2(s % 60)}`
 }
 
-// ─── Alert Card ───────────────────────────────────────────────
-function AlertCard({ alert, index }) {
-  const cfg = STATUS[alert.status] ?? STATUS.monitoring
-  const vehicleColor = COLOR_MAP[alert.color?.toLowerCase()] ?? null
+// Versi yang dibacakan screen reader: "3 menit 48 detik"
+function spokenDuration(s) {
+  const h = Math.floor(s / HOUR_S)
+  const text = `${Math.floor((s % HOUR_S) / 60)} menit ${s % 60} detik`
+  return h > 0 ? `${h} jam ${text}` : text
+}
+
+function fmtClock(date) {
+  return `${pad2(date.getHours())}.${pad2(date.getMinutes())}.${pad2(date.getSeconds())}`
+}
+
+function vehicleName(type, color) {
+  const t = String(type ?? '').toLowerCase()
+  const c = String(color ?? '').toLowerCase()
+  const kind = VEHICLE_LABEL[t] ?? (type || 'Kendaraan')
+  const colour = c && c !== 'unknown' ? (COLOR_LABEL[c] ?? c) : ''
+  return colour ? `${kind} ${colour}` : kind
+}
+
+// Jarak ke batas berikutnya. Hanya untuk title lajur dan teks screen reader,
+// tidak ditampilkan sebagai teks (lajur dan durasi sudah menunjukkannya).
+function countdown(status, d, fmt) {
+  if (status === 'monitoring') return `Peringatan dalam ${fmt(Math.max(0, LANE.WARN_S - d))}`
+  if (status === 'warning') return `Pelanggaran dalam ${fmt(Math.max(0, LANE.VIOL_S - d))}`
+  if (status === 'violation') return `Lewat batas ${fmt(Math.max(0, d - LANE.VIOL_S))}`
+  return 'Segitiga pengaman terdeteksi'
+}
+
+function toRow(a) {
+  return {
+    id: a.id,
+    status: KNOWN_STATUS.has(a.status) ? a.status : 'monitoring',
+    d: Math.max(0, Math.floor(Number(a.duration) || 0)),
+    zone: a.zone,
+    vehicle: vehicleName(a.type, a.color),
+  }
+}
+
+// Pelanggaran, peringatan, memantau, aman; lalu durasi terlama; lalu id terkecil
+function byPriority(a, b) {
+  return STATUS_ORDER[a.status] - STATUS_ORDER[b.status] || b.d - a.d || Number(a.id) - Number(b.id) || 0
+}
+
+function srSentence(r, multiZone) {
+  const zone = multiZone ? `, zona ${r.zone}` : ''
+  return `${STATUS_WORD[r.status]}. ${r.vehicle}, LID${r.id}${zone}. ` +
+    `Berhenti ${spokenDuration(r.d)}. ${countdown(r.status, r.d, spokenDuration)}.`
+}
+
+function liveText(r, multiZone) {
+  const zone = multiZone ? `, zona ${r.zone}` : ''
+  const head = r.status === 'violation' ? 'Pelanggaran baru' : 'Peringatan'
+  return `${head}: ${r.vehicle} LID${r.id}${zone}, ${spokenDuration(r.d)}.`
+}
+
+// Rona merah baris pelanggaran. Memudar sekali hanya saat status benar-benar
+// berubah menjadi pelanggaran; kelasnya dilepas setelah selesai supaya baris
+// yang dipindah saat urutan berubah (DOM move) tidak memutar ulang animasinya.
+function ViolationTint({ animate }) {
+  const [anim, setAnim] = useState(animate)
+  return (
+    <span
+      aria-hidden="true"
+      className={anim ? 'vrow-tint tint-in' : 'vrow-tint'}
+      onAnimationEnd={() => setAnim(false)}
+    />
+  )
+}
+
+function VehicleRow({ row, prev, multiZone }) {
+  const { id, status, d, zone, vehicle } = row
+  return (
+    <li className={ROW_CLASS[status]}>
+      {status === 'violation' && <ViolationTint animate={prev !== undefined && prev !== 'violation'} />}
+      <span className="vrow-glyph" aria-hidden="true"><StatusGlyph status={status} size={18} /></span>
+      <span className="vrow-status" aria-hidden="true">
+        <span className="vrow-word">{STATUS_WORD[status]}</span>
+        <span className="vrow-lid">{`LID${id}`}</span>
+      </span>
+      <span className="vrow-meta" aria-hidden="true">
+        <span className="vrow-vehicle">{vehicle}</span>
+        {multiZone && <span className="vrow-zone">{`Zona ${zone}`}</span>}
+      </span>
+      {/* Lebar isi diganti langsung tiap tick, tanpa animasi */}
+      <span className="lane" aria-hidden="true" title={countdown(status, d, fmtDuration)}>
+        <span className="lane-track" />
+        <span className="lane-rule r1" />
+        <span className="lane-rule r5" />
+        <span className="lane-fill" style={{ width: `${lanePct(d)}%` }} />
+        {d > LANE.MAX_S && <span className="lane-cap" />}
+      </span>
+      <span className={d >= HOUR_S ? 'vrow-dur is-long' : 'vrow-dur'} aria-hidden="true">{fmtDuration(d)}</span>
+      <span className="sr-only">{srSentence(row, multiZone)}</span>
+    </li>
+  )
+}
+
+export default function AlertSidebar({ alerts = NO_ALERTS, multiZone = false, connected = true, staleSince = null }) {
+  const { rows, counts } = useMemo(() => {
+    const counts = { violation: 0, warning: 0, monitoring: 0, safe: 0 }
+    const rows = alerts.map(toRow)
+    for (const r of rows) counts[r.status] += 1
+    rows.sort(byPriority)
+    return { rows, counts }
+  }, [alerts])
+
+  // Status terakhir per id, diperbarui setelah setiap perubahan alerts. Pesan
+  // pertama hanya mengisi Map: id yang belum pernah terlihat tidak dianggap
+  // berubah status, jadi tidak beranimasi dan tidak diumumkan. Id yang hilang
+  // sengaja tidak dihapus: kendaraan yang sempat tertutup lalu muncul lagi
+  // sebagai pelanggaran tetap terhitung berubah status.
+  const prevStatus = useRef(new Map())
+  const [live, setLive] = useState(null)
+
+  useEffect(() => {
+    const prev = prevStatus.current
+    const lines = []
+    for (const r of rows) {
+      const before = prev.get(r.id)
+      if (before !== undefined && before !== r.status && (r.status === 'violation' || r.status === 'warning')) {
+        lines.push(liveText(r, multiZone))
+      }
+      prev.set(r.id, r.status)
+    }
+    if (lines.length > 0) setLive((p) => ({ seq: (p ? p.seq : 0) + 1, text: lines.join(' ') }))
+  }, [rows, multiZone])
+
+  // Data basi: WebSocket putus, daftar tetap menampilkan keadaan terakhir
+  const staleAt = !connected && staleSince ? new Date(staleSince) : null
+  const stale = staleAt !== null
+
+  const others = SUMMARY_PARTS
+    .filter(([key]) => counts[key] > 0)
+    .map(([key, word]) => `${counts[key]} ${word}`)
+    .join(', ')
 
   return (
-    <div
-      className={`alert-enter relative rounded-2xl overflow-hidden ${cfg.pulse ? 'violation-pulse' : ''}`}
-      style={{
-        background:         cfg.bg,
-        border:             `1px solid ${cfg.border}`,
-        animationDelay:     `${index * 40}ms`,
-      }}
-    >
-      {/* Left strip */}
-      <div className="absolute left-0 top-0 bottom-0 w-[3px] rounded-l-full" style={{ background: cfg.strip }} />
-
-      <div className="pl-4 pr-3 py-3 flex gap-3 items-start">
-        {/* Icon block */}
-        <div className="shrink-0 flex flex-col items-center gap-1.5">
-          <div
-            className="w-10 h-10 rounded-xl flex items-center justify-center text-lg"
-            style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid var(--edge)' }}
-          >
-            {VEHICLE_ICON[alert.type?.toLowerCase()] ?? '🚗'}
-          </div>
-          {/* Color dot */}
-          {vehicleColor && (
-            <div
-              className="w-3 h-3 rounded-full ring-1 ring-black/20"
-              style={{ background: vehicleColor }}
-              title={alert.color}
-            />
-          )}
+    <section className={stale ? 'vlist is-stale' : 'vlist'} aria-labelledby="vlist-title">
+      <div className="vlist-head">
+        <div className="vlist-title-row">
+          <h2 id="vlist-title" className="vlist-title">Kendaraan berhenti di zona</h2>
+          <span className="vlist-total">{rows.length}</span>
         </div>
-
-        {/* Info */}
-        <div className="flex-1 min-w-0">
-          {/* Header */}
-          <div className="flex items-start justify-between gap-2 mb-1">
-            <p className="font-semibold text-sm leading-tight" style={{ color: 'var(--text)' }}>
-              {VEHICLE_LABEL[alert.type?.toLowerCase()] ?? alert.type}
-              {alert.color && alert.color !== 'Unknown'
-                ? <span className="font-normal ml-1" style={{ color: 'var(--text-dim)' }}>· {alert.color}</span>
-                : null
-              }
-            </p>
-            <span
-              className="text-[9px] font-semibold px-2 py-0.5 rounded-full shrink-0 flex items-center gap-1"
-              style={{
-                color:      cfg.color,
-                background: cfg.bg,
-                border:     `1px solid ${cfg.border}`,
-              }}
-            >
-              {cfg.emoji} {cfg.label}
-            </span>
-          </div>
-
-          {/* Meta row */}
-          <div className="flex items-center gap-2 text-[10px]" style={{ color: 'var(--text-muted)' }}>
-            <span className="font-mono">{alert.lid}</span>
-            <span>·</span>
-            <span>Zona {alert.zone}</span>
-            {alert.triangle && (
+        {(rows.length > 0 || stale) && (
+          <p className="vlist-summary">
+            {/* Ringkasan selalu dibungkus elemen: .vlist-stale:first-child (tanpa
+                margin) hanya boleh kena kalau cap waktunya berdiri sendiri */}
+            {rows.length > 0 && (counts.violation > 0 ? (
               <>
-                <span>·</span>
-                <span style={{ color: 'var(--green)' }}>◆ Segitiga</span>
+                <span className="vlist-summary-alarm">{`${counts.violation} pelanggaran`}</span>
+                {others && `, ${others}`}
               </>
-            )}
-          </div>
+            ) : (
+              <span>{others ? `Tidak ada pelanggaran. ${others}.` : 'Tidak ada pelanggaran.'}</span>
+            ))}
+            {/* Spasi biasa: margin saja tidak memisahkan kata bagi screen reader */}
+            {stale && rows.length > 0 && ' '}
+            {stale && <span className="vlist-stale">{`Data terakhir ${fmtClock(staleAt)}`}</span>}
+          </p>
+        )}
+      </div>
 
-          {/* Duration */}
-          <div className="flex items-center gap-2 mt-2">
-            <div
-              className="flex-1 h-1 rounded-full overflow-hidden"
-              style={{ background: 'rgba(255,255,255,0.04)' }}
-            >
-              <div
-                className="h-full rounded-full transition-all duration-1000"
-                style={{
-                  width: `${Math.min(100, (alert.duration / 300) * 100)}%`,
-                  background: cfg.color,
-                  opacity: 0.7,
-                }}
-              />
-            </div>
-            <span className="font-mono text-xs font-bold shrink-0" style={{ color: cfg.color }}>
-              {fmt(alert.duration)}
+      {rows.length > 0 ? (
+        <>
+          <div className="vlist-cols" aria-hidden="true">
+            <span className="vlist-cols-status">Status</span>
+            <span className="vlist-cols-lane">
+              <span className="at-1">{`${LANE.WARN_S / 60} mnt`}</span>
+              <span className="at-5">{`${LANE.VIOL_S / 60} mnt`}</span>
             </span>
+            <span className="vlist-cols-dur">Lama</span>
           </div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-// ─── Empty state ──────────────────────────────────────────────
-function EmptyState() {
-  return (
-    <div className="flex flex-col items-center justify-center h-40 gap-3 py-10">
-      <span className="text-3xl opacity-40">🔍</span>
-      <p className="text-xs text-center" style={{ color: 'var(--text-muted)' }}>
-        Belum ada kendaraan terdeteksi di zona pantau
-      </p>
-    </div>
-  )
-}
-
-// ─── Sidebar root ─────────────────────────────────────────────
-export default function AlertSidebar({ alerts = [] }) {
-  const violations = alerts.filter(a => a.status === 'violation').length
-  const warnings   = alerts.filter(a => a.status === 'warning').length
-  const safe       = alerts.filter(a => a.status === 'safe').length
-  const monitoring = alerts.filter(a => a.status === 'monitoring').length
-
-  const sorted = [...alerts].sort((a, b) => {
-    const order = { violation: 0, warning: 1, monitoring: 2, safe: 3 }
-    return (order[a.status] ?? 9) - (order[b.status] ?? 9)
-  })
-
-  const segments = [
-    { count: violations, color: 'var(--red)' },
-    { count: warnings,   color: 'var(--amber)' },
-    { count: monitoring, color: 'var(--edge-bright)' },
-    { count: safe,       color: 'var(--green)' },
-  ].filter(s => s.count > 0)
-
-  return (
-    <div className="flex flex-col h-full gap-3">
-
-      {/* Header */}
-      <div className="flex items-center justify-between shrink-0">
-        <span className="text-[10px] font-mono tracking-widest uppercase" style={{ color: 'var(--text-dim)' }}>
-          Event Log
-        </span>
-        <div className="flex items-center gap-2 text-[10px] font-mono">
-          {violations > 0 && <span style={{ color: 'var(--red)' }}>{violations} 🚨</span>}
-          {warnings   > 0 && <span style={{ color: 'var(--amber)' }}>{warnings} ⚠️</span>}
-          {safe       > 0 && <span style={{ color: 'var(--green)' }}>{safe} ✅</span>}
-        </div>
-      </div>
-
-      {/* Progress bar */}
-      {alerts.length > 0 && (
-        <div className="shrink-0 h-1 rounded-full overflow-hidden flex gap-0.5" style={{ background: 'var(--edge)' }}>
-          {segments.map((s, i) => (
-            <div key={i} className="h-full rounded-full transition-all duration-700"
-              style={{ width: `${(s.count / alerts.length) * 100}%`, background: s.color }} />
-          ))}
+          <ul className="vlist-body">
+            {rows.map((r) => (
+              <VehicleRow key={r.id} row={r} prev={prevStatus.current.get(r.id)} multiZone={multiZone} />
+            ))}
+          </ul>
+        </>
+      ) : (
+        <div className="vlist-empty">
+          <p className="vlist-empty-title">Belum ada kendaraan berhenti di zona.</p>
+          <p className="vlist-empty-text">Kendaraan yang berhenti di zona muncul di sini beserta lama berhentinya.</p>
+          <RuleLane />
         </div>
       )}
 
-      {/* Cards */}
-      <div className="flex-1 overflow-y-auto space-y-2 scroll-thin" style={{ minHeight: 0 }}>
-        {alerts.length === 0
-          ? <EmptyState />
-          : sorted.map((alert, i) => <AlertCard key={alert.id} alert={alert} index={i} />)
-        }
+      {/* Hanya perubahan menjadi peringatan atau pelanggaran. Elemen diganti
+          (key baru) supaya teks yang kebetulan sama tetap dibacakan ulang. */}
+      <div className="sr-only" aria-live="polite">
+        {live && <span key={live.seq}>{live.text}</span>}
       </div>
-
-      {/* Footer */}
-      <div
-        className="shrink-0 flex items-center justify-between pt-2 border-t"
-        style={{ borderColor: 'var(--edge)' }}
-      >
-        <span className="font-mono text-[9px]" style={{ color: 'var(--text-muted)' }}>
-          {alerts.length} kendaraan terpantau
-        </span>
-        <span className="font-mono text-[9px]" style={{ color: 'var(--text-muted)' }}>
-          Refresh setiap 1 detik
-        </span>
-      </div>
-    </div>
+    </section>
   )
 }
