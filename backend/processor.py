@@ -99,7 +99,7 @@ def _env_tracker() -> str:
     return default
 
 
-VEHICLE_MODEL_PATH  = _env_model("PARKING_VEHICLE_MODEL",  "best.pt")      # [ENV]
+VEHICLE_MODEL_PATH  = _env_model("PARKING_VEHICLE_MODEL",  "best_ft1.pt")      # [ENV]
 TRIANGLE_MODEL_PATH = _env_model("PARKING_TRIANGLE_MODEL", "triangle.pt")  # [ENV]
 
 PARKING_CHECK_SECONDS   = 60

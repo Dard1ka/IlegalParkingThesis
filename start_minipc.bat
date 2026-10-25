@@ -17,12 +17,12 @@ rem Aktifkan virtual environment Python
 call environments\Thesis\Scripts\activate.bat
 
 rem ---------------- Konfigurasi ----------------
-rem Model kendaraan: best.pt (YOLO11m, sebelum fine-tune). REKONSTRUKSI iterasi 4:
-rem di sistem akhir (iterasi 5) dua baris ini berisi best_ft1.pt / best_ft1.onnx.
+rem Model kendaraan: hasil fine-tune (pickup tampak depan dan belakang). Model lama
+rem tetap ada: untuk kembali, isi MODEL_PT=best.pt dan MODEL_ONNX=best.onnx.
 rem PENTING: hanya dua baris ini yang menentukan model. Variabel ini MENIMPA
 rem default di backend\processor.py.
-set MODEL_PT=best.pt
-set MODEL_ONNX=best.onnx
+set MODEL_PT=best_ft1.pt
+set MODEL_ONNX=best_ft1.onnx
 rem Versi ONNX Runtime dipakai bila onnxruntime terpasang dan file .onnx ada:
 rem deteksinya identik dengan versi .pt dan jauh lebih cepat di CPU ini
 rem (best.pt 1928 ms vs best.onnx 1145 ms per tick, benchmark 14-10-2026).
