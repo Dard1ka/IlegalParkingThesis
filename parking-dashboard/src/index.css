@@ -388,6 +388,16 @@
   .seg > label:has(input:checked) { z-index: 1; background: var(--text); border-color: var(--text); color: var(--panel); }
   .seg > label:has(input:focus-visible) { z-index: 2; outline: 2px solid var(--focus); outline-offset: 2px; }
 
+  /* Kolom isian (alamat / login kamera IP) */
+  .text-input {
+    display: block; width: 100%; height: 36px; padding: 0 10px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--control); color: var(--text);
+    font: 400 14px/20px var(--font-ui);
+  }
+  .text-input::placeholder { color: var(--text-3); }
+  .text-input:disabled { background: transparent; border-color: var(--separator); color: var(--text-3); cursor: not-allowed; }
+  .field-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; }
+
   /* Unggah file */
   .dropzone {
     display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px;

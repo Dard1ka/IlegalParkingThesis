@@ -58,7 +58,7 @@ class SharedState:
         self._running: bool = False   # thread processor hidup?
 
         # state   : loading_models | waiting_source | opening_source |
-        #           waiting_roi | running | paused | error | stopped
+        #           waiting_roi | running | paused | reconnecting | error | stopped
         # tick    : jumlah tick yang sudah selesai untuk sumber saat ini
         # tick_ms : lama tick terakhir (milidetik jam nyata), None bila belum ada
         # error   : pesan singkat bila state == "error" (atau thread berhenti
@@ -68,6 +68,10 @@ class SharedState:
         # ── Unggahan video yang sedang berjalan (PUT /upload/stream) ──
         # Selama > 0, processor menunda tick sumber file video (state "paused")
         self._uploads_active: int = 0
+
+        # ── Sesi kamera yang sedang berjalan (log + screenshot), None bila tidak ada ──
+        # {"started", "folder", "log_file", "logged", "screenshots"}, lihat LiveSession.info()
+        self._session: Optional[Dict] = None
 
     # ── Frame ─────────────────────────────────────────────────
     def set_frame(self, jpeg: bytes) -> None:
@@ -148,6 +152,7 @@ class SharedState:
             self._frame_jpeg       = None
             self._alerts           = []
             self._stats            = _empty_stats()
+            self._session          = None
 
     def take_source(self) -> Optional[Dict]:
         """Processor ambil source baru; reset pending setelah diambil."""
@@ -194,6 +199,16 @@ class SharedState:
     def upload_active(self) -> bool:
         with self._lock:
             return self._uploads_active > 0
+
+    # ── Sesi kamera ───────────────────────────────────────────
+    def set_session(self, info: Optional[Dict]) -> None:
+        with self._lock:
+            if info is None or self._source_pending is None:      # aturan "data basi"
+                self._session = info
+
+    def get_session(self) -> Optional[Dict]:
+        with self._lock:
+            return dict(self._session) if self._session else None
 
     # ── Status processor ("proc") ─────────────────────────────
     def set_proc_state(self, state: str, error: Optional[str] = None) -> None:

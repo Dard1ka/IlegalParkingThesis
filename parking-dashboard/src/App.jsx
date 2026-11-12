@@ -4,6 +4,7 @@ import AlertSidebar from './components/AlertSidebar'
 import SetupWizard from './components/SetupWizard'
 import { Rambu, FaultGlyph } from './components/Glyphs'
 import { useAlerts } from './hooks/useAlerts'
+import { API_BASE } from './config'
 
 // Catatan render: mini PC menggambar semua frame dengan CPU (tanpa GPU), jadi
 // header ini hanya berisi warna datar, garis 1 px, teks, dan SVG kecil. Yang
@@ -62,6 +63,7 @@ const PROC_STATE = {
   waiting_roi:    { label: 'Menunggu zona',         waiting: true },
   running:        { label: 'Deteksi berjalan' },
   paused:         { label: 'Deteksi ditunda selama video diunggah', waiting: true },
+  reconnecting:   { label: 'Kamera terputus, menyambung ulang', waiting: true },
   stopped:        { label: 'Deteksi berhenti', strong: true },
 }
 const PROC_UNKNOWN = { label: 'Status deteksi belum diketahui' }
@@ -121,9 +123,10 @@ function SystemStatus({ connected, error, procError, procState }) {
 }
 
 // ─── Label setup (dari info wizard, boleh tidak ada) ──────────
-// Nama sumber untuk toolbar video: "Kamera 0" atau nama file video
+// Nama sumber untuk toolbar video: "Kamera 0", "Kamera IP 192.168.1.64:554", atau nama file video
 function getSourceLabel(setup) {
   if (setup?.sourceType === 'camera') return setup.camIndex != null ? `Kamera ${setup.camIndex}` : 'Kamera'
+  if (setup?.sourceType === 'rtsp') return setup.host ? `Kamera IP ${setup.host}` : 'Kamera IP'
   if (setup?.sourceType === 'video') {
     if (setup.filename) return String(setup.filename)
     if (typeof setup.path === 'string') return setup.path.split(/[\\/]/).pop() || null
@@ -228,12 +231,56 @@ function Dashboard({ onReconfigure, setup = null }) {
   )
 }
 
+// ─── Sesi kamera yang sedang berjalan (GET /status) ──────────
+// Halaman dimuat ulang (atau browser dibuka lagi) saat backend masih memantau
+// kamera: dashboard langsung tampil tanpa wizard, supaya sesi (kendaraan dan
+// durasinya) tidak diulang dari nol karena kamera dipilih lagi.
+const RESUME_STATES = new Set(['running', 'reconnecting', 'opening_source'])
+const STATUS_TIMEOUT_MS = 2500
+
+// "rtsp://admin:***@192.168.1.64:554/Streaming/..." → "192.168.1.64:554"
+function rtspHost(url) {
+  const m = /^[a-z]+:\/\/(?:[^@/]*@)?([^/]+)/i.exec(String(url || ''))
+  return m ? m[1] : null
+}
+
+// Info "setup" dari /status, atau null bila tidak ada sesi kamera yang berjalan
+function liveSetupFromStatus(status) {
+  const src = status?.source
+  if (!status?.running || !src || !RESUME_STATES.has(status?.proc?.state)) return null
+  const roiMode = status.roi_mode === 'manual' ? 'manual' : 'auto'
+  const zoneCount = Number.isInteger(status.session?.zones) ? status.session.zones : undefined
+  if (src.type === 'rtsp') return { sourceType: 'rtsp', host: rtspHost(src.url), roiMode, zoneCount }
+  if (src.type === 'camera') return { sourceType: 'camera', camIndex: src.index ?? 0, roiMode, zoneCount }
+  return null
+}
+
 // ─── Root ─────────────────────────────────────────────────────
 export default function App() {
-  // "setup" = tampil wizard, "dashboard" = tampil main UI
-  const [view, setView] = useState('setup')
-  // Info dari wizard ({ sourceType, path/filename | camIndex, roiMode, zoneCount? }), boleh null
+  // "checking" = cek sesi kamera yang sedang berjalan, "setup" = tampil wizard,
+  // "dashboard" = tampil main UI
+  const [view, setView] = useState('checking')
+  // Info dari wizard ({ sourceType, path/filename | camIndex | url/host, roiMode, zoneCount? }), boleh null
   const [setup, setSetup] = useState(null)
+
+  useEffect(() => {
+    let alive = true
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), STATUS_TIMEOUT_MS)
+    fetch(`${API_BASE}/status`, { cache: 'no-store', signal: ctrl.signal })
+      .then((res) => (res.ok ? res.json() : null))
+      .catch(() => null)
+      .then((status) => {
+        if (!alive) return
+        const live = liveSetupFromStatus(status)
+        if (live) setSetup(live)
+        setView(live ? 'dashboard' : 'setup')
+      })
+      .finally(() => clearTimeout(timer))
+    return () => { alive = false; ctrl.abort(); clearTimeout(timer) }
+  }, [])
+
+  if (view === 'checking') return null
 
   // Dashboard sengaja di-UNMOUNT saat kembali ke wizard: WebSocket & koneksi
   // MJPEG ikut ditutup (jangan diganti jadi overlay di atas dashboard).

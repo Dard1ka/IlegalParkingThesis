@@ -20,8 +20,9 @@ Perubahan utama vs demo3_tts.py:
 from __future__ import annotations
 from collections import OrderedDict
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, asdict
 from typing import List, Tuple, Dict, Optional
+from urllib.parse import urlsplit, urlunsplit
 import math, time, asyncio, threading, os, hashlib, re, textwrap, traceback
 
 import cv2
@@ -29,6 +30,7 @@ import numpy as np
 from ultralytics import YOLO
 
 from .shared import SharedState
+from .live_session import LiveSession, protect_secret, unprotect_secret
 
 
 # ══════════════════════════════════════════════════════════════
@@ -167,7 +169,12 @@ COLOR_SAMPLE_MIN_IOU   = 0.60   # suara ke-2 dst. dilewati bila kotak bergeser /
 
 # strip(): "set ENABLE_TTS=false && uvicorn ..." di cmd menyimpan "false " (dengan spasi)
 ENABLE_TTS      = os.environ.get("ENABLE_TTS", "true").strip().lower() not in ("false", "0", "no")
-TTS_REPEAT_GAP  = 20
+TTS_ANNOUNCE_GAP = 30      # detik antar peringatan suara selama masih ada pelanggar (pelanggar
+                           # pertama langsung disuarakan); satu kalimat menyebut semua pelanggar
+TTS_SAY_TIMES   = 2        # tiap peringatan diucapkan segini kali berturut-turut
+TTS_SAY_PAUSE   = 0.8      # detik jeda antar ulangan
+VIOLATOR_HIDDEN_GRACE = 10 # pelanggar yang baru tersembunyi <= segini detik (tertutup kendaraan
+                           # lewat) tetap disebut di peringatan suara dan screenshot
 EDGE_TTS_VOICE  = "id-ID-GadisNeural"
 EDGE_TTS_RATE   = "+0%"
 EDGE_TTS_VOLUME = "+0%"
@@ -199,6 +206,31 @@ GRAB_TIME_TOLERANCE    = 0.45   # satuan frame: selisih terbesar yang diterima a
 CAMERA_READ_RETRIES    = 5      # baca ulang sebelum perangkat kamera dibuka ulang
 CAMERA_REOPEN_ATTEMPTS = 3      # buka ulang perangkat sebelum menyerah
 CAMERA_RETRY_WAIT      = 0.5    # detik antar percobaan (hanya saat kamera gagal dibuka / dibaca)
+
+# ── Kamera IP (RTSP) ───────────────────────────────────────────
+LIVE_SOURCE_TYPES    = ("camera", "rtsp")  # sumber langsung: tanpa akhir video, detik = jam nyata
+RTSP_OPEN_TIMEOUT_MS = 5000    # batas waktu FFmpeg membuka stream kamera IP (di LAN biasanya < 1 s;
+                               # IP salah / ditolak baru dilaporkan setelah batas ini)
+RTSP_READ_TIMEOUT_MS = 10000   # batas waktu FFmpeg menunggu data stream sebelum read() gagal
+RTSP_FRAME_WAIT      = 3.0     # detik read() RtspCapture menunggu frame BARU sebelum dianggap gagal
+RTSP_STOP_WAIT       = 2.0     # detik menunggu thread pembaca selesai saat stream ditutup
+
+# ── Sesi kamera: sambung ulang, log, screenshot (lihat live_session.py) ──
+# Tidak mengubah deteksi: hanya kapan kamera dibuka ulang dan apa yang ditulis ke file.
+LIVE_RECONNECT_WAITS     = (2, 5, 10, 20, 30)  # jeda antar percobaan sambung ulang kamera yang putus;
+                                               # setelah habis tetap tiap 30 detik, tanpa batas
+LIVE_ERROR_RETRY_SECONDS = 10    # error tak terduga di tengah sesi kamera: sesi dilanjutkan setelah segini
+LIVE_GAP_SECONDS         = 10    # dua tick berjarak lebih dari ini = jeda tanpa pengamatan (kamera putus):
+                                 # kendaraan yang pergi selama jeda tidak dihitung berhenti selama jeda
+SESSION_SAVE_SECONDS     = 5     # state sesi kamera disimpan ke disk tiap segini detik
+SESSION_RESUME_MAX_GAP   = 600   # backend hidup lagi <= segini detik setelah simpanan terakhir →
+                                 # sesi (kamera + kendaraan + durasinya) dilanjutkan otomatis
+SCREENSHOT_INTERVAL      = 300   # screenshot pelanggaran tiap segini detik selama masih ada pelanggar
+                                 # (pelanggar pertama setelah tidak ada pelanggar: langsung)
+
+# RTSP lewat TCP: di UDP paket yang hilang membuat gambar rusak (bercak abu-abu).
+# Harus diset sebelum stream pertama dibuka; nilai dari environment tetap dipakai.
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
 
 
 def print_effective_config() -> None:
@@ -629,7 +661,14 @@ class TTSSpeaker:
             try:
                 path, from_network = self._audio_for(message)
                 audio_stage = True
-                self._play(path)
+                # Satu peringatan = kalimat yang sama TTS_SAY_TIMES kali, dengan jeda pendek.
+                # clear() / close() (self._abort) memotong ulangan yang tersisa.
+                for n in range(TTS_SAY_TIMES):
+                    if n:
+                        time.sleep(TTS_SAY_PAUSE)
+                    if self._abort:
+                        break
+                    self._play(path)
                 with self._cv:
                     # Jeda dicabut hanya bila penyebabnya terbukti sudah pulih: audio
                     # dari cache yang berhasil diputar belum membuktikan jaringan normal.
@@ -727,7 +766,8 @@ class TTSSpeaker:
             self._audio_down  = audio_stage
             # Pesan yang sudah antre dan pasti gagal ikut dibuang: satu gangguan =
             # satu baris peringatan + satu jeda, bukan jeda yang berlipat per pesan.
-            # Loop tick mengajukannya lagi setelah TTS_REPEAT_GAP.
+            # Loop tick mengajukannya lagi pada tick berikutnya (jadwal TTS_ANNOUNCE_GAP
+            # baru maju setelah pesan diterima).
             self._queue = [item for item in self._queue if not self._on_hold(item[1])]
             wait = self._backoff
         what   = "Pemutaran audio" if audio_stage else "Sintesis suara"
@@ -774,6 +814,42 @@ def choose_status(rec: ParkedRecord, logic_second: int):
         if rec.triangle_found: return (0, 255, 0), "aman / mogok"
         return (0, 255, 255), "warning"
     return (255, 200, 0), "monitoring"
+
+def status_for_duration(duration: int, rec: ParkedRecord) -> str:
+    """Status dashboard ("monitoring" / "warning" / "safe" / "violation") untuk durasi berhenti ini."""
+    if duration >= ILLEGAL_PARKING_SECONDS and not rec.triangle_found: return "violation"
+    if duration >= PARKING_CHECK_SECONDS:
+        return "safe" if rec.triangle_found else "warning"
+    return "monitoring"
+
+def stop_end_second(rec: ParkedRecord, logic_second: int) -> int:
+    """
+    Detik terakhir kendaraan masih berhenti: saat mulai bergerak lagi atau saat
+    tidak terlihat lagi, mana yang lebih dulu; kendaraan yang masih diam dan
+    terlihat → logic_second. (Record yang belum pernah parkir tidak dicatat;
+    untuknya nilai ini tidak dipakai.)
+    """
+    ends = [s for s in (rec.moving_since, rec.hidden_since) if s is not None]
+    end = min(ends) if ends else logic_second
+    return end if rec.parked_since is None else max(rec.parked_since, end)
+
+# Field ParkedRecord berupa tuple (JSON menyimpannya sebagai list)
+_RECORD_INT_BOXES    = ("bbox", "parked_bbox")
+_RECORD_FLOAT_POINTS = ("center", "prev_logic_center", "parked_center")
+
+def record_from_state(data: Dict) -> ParkedRecord:
+    """ParkedRecord dari asdict() yang tersimpan di state sesi kamera. Id tracker tidak
+    dibawa (tracker proses baru mulai dari nol); record di-relink dari posisinya."""
+    known = {f.name for f in fields(ParkedRecord)}
+    data = {k: v for k, v in data.items() if k in known}
+    for k in _RECORD_INT_BOXES:
+        if data.get(k) is not None:
+            data[k] = tuple(int(v) for v in data[k])
+    for k in _RECORD_FLOAT_POINTS:
+        if data.get(k) is not None:
+            data[k] = tuple(float(v) for v in data[k])
+    data["tracker_id"] = None
+    return ParkedRecord(**data)
 
 def get_required_moving_reset_seconds(rec: ParkedRecord, logic_second: int) -> int:
     if rec.parked_since is None: return MOVING_RESET_SECONDS
@@ -967,6 +1043,147 @@ def _short_error(exc: BaseException) -> str:
     return text[:240]
 
 
+def mask_url(url: str) -> str:
+    """
+    Alamat stream tanpa password, untuk log, dashboard, dan GET /status:
+    rtsp://admin:rahasia@192.168.1.64:554/... → rtsp://admin:***@192.168.1.64:554/...
+    """
+    try:
+        parts = urlsplit(url)
+        if parts.password is None:
+            return url
+        host = parts.netloc.rpartition("@")[2]
+        return urlunsplit(parts._replace(netloc=f"{parts.username}:***@{host}"))
+    except ValueError:
+        return "(alamat stream tidak valid)"
+
+
+def public_source(source: Optional[Dict]) -> Optional[Dict]:
+    """Salinan config sumber yang aman ditampilkan (password kamera IP disamarkan)."""
+    if not source or source.get("type") != "rtsp":
+        return source
+    return {**source, "url": mask_url(source.get("url", ""))}
+
+
+def _rtsp_open_params() -> List[int]:
+    """Batas waktu buka / baca untuk cv2.VideoCapture (diabaikan bila OpenCV tidak mengenalnya)."""
+    params = []
+    for name, value in (("CAP_PROP_OPEN_TIMEOUT_MSEC", RTSP_OPEN_TIMEOUT_MS),
+                        ("CAP_PROP_READ_TIMEOUT_MSEC", RTSP_READ_TIMEOUT_MS)):
+        prop = getattr(cv2, name, None)
+        if prop is not None:
+            params += [prop, value]
+    return params
+
+
+class RtspCapture:
+    """
+    Kamera IP (RTSP) yang selalu memberikan frame TERBARU.
+
+    cv2.VideoCapture membaca stream RTSP berurutan: frame yang belum dibaca
+    menumpuk di antrean FFmpeg. Satu tick deteksi di mini PC makan 1-2 detik,
+    sedangkan kamera mengirim 10-25 frame per detik, jadi tanpa kelas ini
+    gambar yang diproses makin lama makin tertinggal dari kejadian nyata.
+    Thread pembaca terus memanggil read() dan hanya menyimpan frame terakhir;
+    read() kelas ini mengembalikan frame terbaru yang belum pernah diberikan.
+
+    Antarmukanya bagian cv2.VideoCapture yang dipakai jalur kamera
+    (isOpened, read, grab, get, open, release), jadi _run_inner,
+    _retry_camera_open, dan _recover_camera tetap satu jalur untuk webcam
+    dan kamera IP.
+    """
+
+    def __init__(self, url: str):
+        self._url    = url
+        self._cond   = threading.Condition()
+        self._thread: Optional[threading.Thread] = None
+        self._halt   = threading.Event()    # milik sesi pembaca yang sedang berjalan
+        self._frame: Optional[np.ndarray] = None
+        self._seq    = 0                    # nomor frame terakhir dari pembaca
+        self._given  = 0                    # nomor frame terakhir yang dikembalikan read()
+        self._alive  = False                # pembaca sesi ini masih menerima frame
+        self._props: Dict[int, float] = {}
+        self.open(url)
+
+    def open(self, url: Optional[str] = None) -> bool:
+        """Buka (ulang) stream dan jalankan pembaca baru. Memblokir sampai RTSP_OPEN_TIMEOUT_MS."""
+        self.release()
+        if url is not None:
+            self._url = url
+        cap = cv2.VideoCapture(self._url, cv2.CAP_FFMPEG, _rtsp_open_params())
+        if not cap.isOpened():
+            cap.release()
+            return False
+        # Dibaca sekarang, sebelum pembaca jalan: cv2.VideoCapture tidak aman dipakai dua thread
+        self._props = {p: cap.get(p) for p in (cv2.CAP_PROP_FPS, cv2.CAP_PROP_FRAME_WIDTH,
+                                               cv2.CAP_PROP_FRAME_HEIGHT)}
+        halt = threading.Event()
+        with self._cond:
+            self._frame, self._seq, self._given, self._alive = None, 0, 0, True
+        self._halt   = halt
+        self._thread = threading.Thread(target=self._reader, args=(cap, halt),
+                                        name="rtsp-reader", daemon=True)
+        self._thread.start()
+        return True
+
+    def _reader(self, cap, halt: threading.Event) -> None:
+        # Capture hanya disentuh thread ini, dan dilepas di sini juga: release()
+        # tidak menunggu read() yang sedang tertahan (bisa sampai RTSP_READ_TIMEOUT_MS).
+        try:
+            while not halt.is_set():
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                with self._cond:
+                    if halt.is_set():       # sesi ini sudah ditutup: jangan timpa frame sesi baru
+                        break
+                    self._frame = frame
+                    self._seq  += 1
+                    self._cond.notify_all()
+        finally:
+            cap.release()
+            with self._cond:
+                if not halt.is_set():
+                    self._alive = False     # stream putus: read() berikutnya langsung gagal
+                    self._cond.notify_all()
+
+    def isOpened(self) -> bool:
+        with self._cond:
+            return self._thread is not None and (self._alive or self._seq != self._given)
+
+    def read(self):
+        """(True, frame terbaru yang belum pernah diberikan), atau (False, None)."""
+        deadline = time.monotonic() + RTSP_FRAME_WAIT
+        with self._cond:
+            while self._seq == self._given and self._alive:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                self._cond.wait(left)
+            if self._seq == self._given:
+                return False, None
+            self._given = self._seq
+            return True, self._frame
+
+    def grab(self) -> bool:
+        # Tidak perlu menguras buffer: pembaca selalu menyimpan frame terbaru saja
+        return self.isOpened()
+
+    def get(self, prop: int) -> float:
+        return self._props.get(prop, 0.0)
+
+    def release(self) -> None:
+        thread, self._thread = self._thread, None
+        if thread is None:
+            return
+        self._halt.set()
+        with self._cond:
+            self._alive = False
+            self._frame = None
+            self._cond.notify_all()
+        thread.join(RTSP_STOP_WAIT)
+
+
 class VideoProcessor:
     """
     Jalankan processor.run() di background thread.
@@ -983,9 +1200,151 @@ class VideoProcessor:
         self.shared  = shared
         self._stop   = threading.Event()
         self._tts: Optional[TTSSpeaker] = None   # dibuat di run() bila ENABLE_TTS
+        # State sesi kamera tersimpan yang akan dilanjutkan oleh _run_inner berikutnya
+        # (backend hidup lagi / error di tengah sesi), lihat _load_resume
+        self._resume: Optional[Dict] = None
 
     def stop(self):
         self._stop.set()
+
+    # ── Sesi kamera: simpan, lanjutkan, tutup ──────────────────
+    @staticmethod
+    def _same_live_source(a: Optional[Dict], b: Optional[Dict]) -> bool:
+        if not a or not b or a.get("type") != b.get("type"):
+            return False
+        if a.get("type") == "rtsp":
+            return a.get("url") == b.get("url")
+        return int(a.get("index", 0)) == int(b.get("index", 0))
+
+    @staticmethod
+    def _source_state(source: Dict) -> Optional[Dict]:
+        """Sumber dalam bentuk yang aman disimpan; None bila tidak bisa (alamat tidak terenkripsi)."""
+        if source.get("type") == "rtsp":
+            blob = protect_secret(source.get("url", ""))
+            return {"type": "rtsp", "url_protected": blob,
+                    "url_public": mask_url(source.get("url", ""))} if blob else None
+        return {"type": "camera", "index": int(source.get("index", 0))}
+
+    @staticmethod
+    def _source_from_state(saved: Dict) -> Optional[Dict]:
+        if saved.get("type") == "rtsp":
+            url = unprotect_secret(saved.get("url_protected", ""))
+            return {"type": "rtsp", "url": url} if url else None
+        if saved.get("type") == "camera":
+            return {"type": "camera", "index": int(saved.get("index", 0))}
+        return None
+
+    @staticmethod
+    def _log_stop(session: Optional[LiveSession], lid: int, rec: ParkedRecord, end_second: int,
+                  reason: str, last_seen: Optional[int] = None) -> None:
+        """
+        Satu baris log untuk kendaraan yang selesai berhenti (record yang pernah parkir
+        saja). last_seen: detik terakhir kendaraan ini benar-benar teramati bila
+        setelahnya ada jeda tanpa pengamatan (kamera putus / backend mati), supaya
+        jeda itu tidak ikut dihitung sebagai waktu berhenti.
+        """
+        if session is None or rec.parked_since is None:
+            return
+        if last_seen is not None:
+            end_second = min(end_second, last_seen)
+        end_second = max(rec.parked_since, end_second)
+        triangle = ("ada" if rec.triangle_found else "tidak ada") if rec.triangle_checked else "belum dicek"
+        session.log_vehicle(lid, describe_vehicle(rec), rec.roi_idx + 1, rec.parked_since, end_second,
+                            status_for_duration(end_second - rec.parked_since, rec), triangle, reason)
+
+    def _log_all_stops(self, session: Optional[LiveSession], parked_records: Dict, last_tick: int,
+                       reason: str, gap_seen: Optional[Dict[int, int]] = None) -> None:
+        """
+        Semua kendaraan yang sedang berhenti dicatat (sesi berakhir / zona diubah).
+        last_tick = detik tick terakhir yang benar-benar dianalisis: kendaraan yang
+        masih terlihat dicatat sampai detik itu, bukan sampai "sekarang".
+        """
+        gap_seen = gap_seen or {}
+        order = sorted(parked_records.items(), key=lambda kv: (kv[1].parked_since or 0, kv[0]))
+        for lid, rec in order:
+            if rec.parked_since is not None:
+                self._log_stop(session, lid, rec, stop_end_second(rec, last_tick), reason,
+                               gap_seen.get(lid))
+
+    @staticmethod
+    def _gap_from_state(state: Dict) -> Dict[int, int]:
+        return {int(k): int(v) for k, v in (state.get("gap_seen") or {}).items()}
+
+    def _finish_saved_session(self, state: Dict, reason: str) -> None:
+        """State sesi tersimpan yang TIDAK dilanjutkan: kendaraannya dicatat, log ditutup, state dibuang."""
+        try:
+            session = LiveSession.reopen(state)
+            records = {int(k): record_from_state(v) for k, v in (state.get("records") or {}).items()}
+            last_tick = int(state.get("last_tick", state.get("logic_second", 0)))
+            self._log_all_stops(session, records, last_tick, reason, self._gap_from_state(state))
+            session.close(reason)
+        except (KeyError, TypeError, ValueError) as e:
+            print(f"[SESI] State sesi lama rusak, tidak bisa ditutup rapi: {e}")
+        LiveSession.discard_state()
+
+    @staticmethod
+    def _save_live(live: Dict) -> None:
+        """Simpan state sesi kamera sekarang (bila sesinya bisa dilanjutkan)."""
+        session = live.get("session")
+        if session is not None and live.get("source_state") is not None:
+            session.save_state(live["state"]())
+
+    def _load_resume(self, expect: Optional[Dict] = None) -> Optional[Dict]:
+        """
+        State sesi kamera tersimpan yang boleh dilanjutkan: disimpan paling lama
+        SESSION_RESUME_MAX_GAP detik lalu dan alamat kameranya bisa dibuka. Kunci
+        "_source" = config sumbernya. State lain (terlalu lama, tidak cocok dengan
+        `expect`) ditutup: kendaraannya dicatat ke log sesi itu, lalu dibuang.
+        """
+        state = LiveSession.load_state()
+        if state is None:
+            return None
+        source = self._source_from_state(state.get("source") or {})
+        try:
+            saved = float(state.get("saved_wall", 0))
+        except (TypeError, ValueError):
+            saved = 0.0
+        gap = time.time() - saved
+        if (source is not None and 0 <= gap <= SESSION_RESUME_MAX_GAP
+                and (expect is None or self._same_live_source(source, expect))):
+            state["_source"] = source
+            return state
+        if gap > SESSION_RESUME_MAX_GAP:
+            reason = (f"backend tidak berjalan sejak {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(saved))} "
+                      f"(lebih dari {SESSION_RESUME_MAX_GAP // 60} menit)")
+        else:
+            reason = "sesi tidak bisa dilanjutkan"
+        self._finish_saved_session(state, reason)
+        return None
+
+    def _end_live(self, live: Dict, reason: str) -> None:
+        """Sesi kamera berakhir (sumber diganti): kendaraan yang tersisa dicatat, log ditutup."""
+        session = live.get("session")
+        if session is None:
+            return
+        state = live["state"]()
+        self._log_all_stops(session, live["records"], state["last_tick"], reason,
+                            self._gap_from_state(state))
+        session.close(reason)
+        LiveSession.discard_state()
+        self.shared.set_session(None)
+
+    def _suspend_live(self, live: Dict, why: str) -> None:
+        """
+        Sesi kamera terhenti tanpa diganti (backend dihentikan / error): state disimpan
+        supaya sesi dilanjutkan saat backend hidup lagi. Tanpa alamat terenkripsi
+        sesi tidak bisa dilanjutkan, jadi ditutup biasa.
+        """
+        session = live.get("session")
+        if session is None:
+            return
+        if live.get("source_state") is None:
+            self._end_live(live, why)
+            return
+        self._save_live(live)
+        session.event(f"{why}; sesi dilanjutkan otomatis bila backend berjalan lagi "
+                      f"dalam {SESSION_RESUME_MAX_GAP // 60} menit.")
+        LiveSession.flush()
 
     # ── Konversi ROI dari frontend → pixel polygon ─────────────
     def _decode_roi(self, rois_raw: list, W: int, H: int) -> List[List[Tuple[int, int]]]:
@@ -1010,11 +1369,7 @@ class VideoProcessor:
 
     # ── Konversi parked_records → list dict untuk JSON ─────────
     def _to_status_str(self, rec: ParkedRecord, logic_second: int) -> str:
-        d = get_elapsed_seconds(rec, logic_second)
-        if d >= ILLEGAL_PARKING_SECONDS and not rec.triangle_found: return "violation"
-        if d >= PARKING_CHECK_SECONDS:
-            return "safe" if rec.triangle_found else "warning"
-        return "monitoring"
+        return status_for_duration(get_elapsed_seconds(rec, logic_second), rec)
 
     def _build_alerts(self, parked_records: Dict, logic_second: int) -> List[Dict]:
         """Buat list alert yang bisa di-serialize ke JSON untuk WebSocket."""
@@ -1080,7 +1435,22 @@ class VideoProcessor:
     def _describe_source(source: dict) -> str:
         if source.get("type") == "camera":
             return f"kamera index {source.get('index', 0)}"
+        if source.get("type") == "rtsp":
+            return f"kamera IP {mask_url(source.get('url', ''))}"
         return str(source.get("path"))
+
+    @classmethod
+    def _source_title(cls, source: dict) -> str:
+        """_describe_source untuk awal kalimat ("Kamera index 0", "Kamera IP rtsp://...")."""
+        text = cls._describe_source(source)
+        return text[:1].upper() + text[1:]
+
+    @staticmethod
+    def _camera_target(source: dict):
+        """Argumen cap.open() untuk membuka ulang sumber langsung: index webcam atau alamat RTSP."""
+        if source.get("type") == "rtsp":
+            return source["url"]
+        return int(source.get("index", 0))
 
     @staticmethod
     def _reset_tracker(vehicle_model):
@@ -1149,7 +1519,19 @@ class VideoProcessor:
             self.shared.set_proc_state("waiting_source")
             self._push_text_frame("Menunggu konfigurasi sumber...",
                                   ["Buka dashboard → pilih Video atau Kamera"])
-            print("[PROC] Menunggu konfigurasi sumber dari frontend...")
+            # Backend mati mendadak di tengah sesi kamera lalu dijalankan lagi: sesi
+            # itu dilanjutkan tanpa menunggu dashboard (kamera, zona, kendaraan)
+            resume = self._load_resume()
+            if resume is not None and self.shared.has_source_pending():
+                self._finish_saved_session(resume, "sumber lain dipilih dari dashboard")
+                resume = None
+            if resume is not None:
+                print(f"[PROC] Melanjutkan sesi kamera {resume.get('folder')}: "
+                      f"{self._describe_source(resume['_source'])}")
+                self._resume = resume
+                self.shared.set_source(resume["_source"], resume.get("roi_mode") or "auto")
+            else:
+                print("[PROC] Menunggu konfigurasi sumber dari frontend...")
 
         source = None
         while not self._stop.is_set():
@@ -1182,6 +1564,15 @@ class VideoProcessor:
                 # memuat model baru. Sumber yang gagal (SourceError) tidak menyentuh model.
                 if not isinstance(e, SourceError) and not self._tracker_ready(models[0]):
                     models = None
+                # Error tak terduga di tengah sesi kamera: state-nya sudah disimpan
+                # (_run_source), jadi sesi yang sama dilanjutkan sebentar lagi, kecuali
+                # stop() atau dashboard memilih sumber lain.
+                if (not isinstance(e, SourceError) and current.get("type") in LIVE_SOURCE_TYPES
+                        and not self._wait_interrupted(LIVE_ERROR_RETRY_SECONDS)):
+                    resume = self._load_resume(expect=current)
+                    if resume is not None:
+                        print("[PROC] Sesi kamera dilanjutkan setelah error.")
+                        self._resume, source = resume, current
 
     def _open_source(self, source: dict):
         """Buka video file atau kamera berdasarkan config."""
@@ -1190,6 +1581,10 @@ class VideoProcessor:
             idx = int(source.get("index", 0))
             cap = cv2.VideoCapture(idx)
             print(f"[PROC] Membuka kamera index {idx}...")
+        elif src_type == "rtsp":
+            # Dicetak sebelum membuka: membuka stream bisa memblokir sampai RTSP_OPEN_TIMEOUT_MS
+            print(f"[PROC] Membuka {self._describe_source(source)}...")
+            cap = RtspCapture(source["url"])
         else:
             path = source["path"]
             cap = cv2.VideoCapture(path)
@@ -1205,11 +1600,43 @@ class VideoProcessor:
         self._reset_tracker(vehicle_model)      # ID / track sumber sebelumnya tidak boleh terbawa
         if self._tts is not None:
             self._tts.clear()
+        # Sesi kamera (diisi _run_inner): menentukan nasib log dan state saat sumber ini selesai
+        live: Dict = {}
         cap = self._open_source(source)
         try:
-            return self._run_inner(cap, source, vehicle_model, triangle_model)
+            result = self._run_inner(cap, source, vehicle_model, triangle_model, live)
+        except BaseException as e:
+            self._close_live(live, suspend=True, why=f"Deteksi berhenti karena error ({_short_error(e)})")
+            raise
         finally:
             cap.release()
+        if self._stop.is_set():
+            self._close_live(live, suspend=True, why="Backend dihentikan")
+        else:
+            self._close_live(live, suspend=False, why="sumber diganti dari dashboard")
+        return result
+
+    def _close_live(self, live: Dict, suspend: bool, why: str) -> None:
+        """_suspend_live / _end_live yang tidak pernah melempar: error asli sumber tetap terlihat."""
+        try:
+            if suspend:
+                self._suspend_live(live, why)
+            else:
+                self._end_live(live, why)
+        except Exception:
+            print("[SESI] Sesi kamera tidak bisa disimpan / ditutup:")
+            traceback.print_exc()
+
+    def _wait_interrupted(self, seconds: float) -> bool:
+        """Tunggu `seconds`; True (lebih cepat) bila stop() atau ada /configure baru."""
+        deadline = time.monotonic() + seconds
+        while True:
+            if self._stop.is_set() or self.shared.has_source_pending():
+                return True
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return False
+            self._stop.wait(min(0.25, left))
 
     def _retry_camera_open(self, cap, source: dict) -> bool:
         """
@@ -1219,32 +1646,33 @@ class VideoProcessor:
         yang tetap menghormati stop(). Return False bila stop() atau ada sumber
         baru; selain itu True (terbuka atau tidak, diperiksa pemanggil).
         """
-        idx = int(source.get("index", 0))
+        target = self._camera_target(source)
         for attempt in range(1, CAMERA_REOPEN_ATTEMPTS + 1):
             if self._stop.wait(CAMERA_RETRY_WAIT) or self.shared.has_source_pending():
                 return False
-            print(f"[PROC] Kamera index {idx} belum terbuka, mencoba lagi "
+            print(f"[PROC] {self._source_title(source)} belum terbuka, mencoba lagi "
                   f"(percobaan {attempt}/{CAMERA_REOPEN_ATTEMPTS})...")
-            cap.open(idx)                       # parameter sama dengan cv2.VideoCapture(idx)
+            cap.open(target)                    # parameter sama dengan saat sumber dibuka
             if cap.isOpened():
                 break
         return True
 
-    def _recover_camera(self, cap, source: dict) -> Optional[np.ndarray]:
+    def _recover_camera(self, cap, source: dict, live: Optional[Dict] = None) -> Optional[np.ndarray]:
         """
         cap.read() kamera gagal: baca ulang beberapa kali, lalu buka ulang
         perangkatnya beberapa kali, dengan jeda pendek yang tetap menghormati
-        stop(). Return frame bila pulih; None bila stop() atau ada sumber baru;
-        SourceError bila tetap gagal.
+        stop(). Masih gagal → kamera dianggap terputus dan disambung ulang terus
+        (_reconnect_live). Return frame bila pulih; None bila stop() atau ada
+        sumber baru.
         """
-        idx = int(source.get("index", 0))
+        target = self._camera_target(source)
         print("[PROC] Kamera gagal baca frame, mencoba ulang...")
         for attempt in range(CAMERA_REOPEN_ATTEMPTS + 1):
             if attempt:
-                print(f"[PROC] Membuka ulang kamera index {idx} "
+                print(f"[PROC] Membuka ulang {self._describe_source(source)} "
                       f"(percobaan {attempt}/{CAMERA_REOPEN_ATTEMPTS})...")
                 cap.release()
-                cap.open(idx)                   # parameter sama dengan cv2.VideoCapture(idx)
+                cap.open(target)                # parameter sama dengan saat sumber dibuka
             for _ in range(CAMERA_READ_RETRIES):
                 if self._stop.wait(CAMERA_RETRY_WAIT) or self.shared.has_source_pending():
                     return None
@@ -1253,8 +1681,51 @@ class VideoProcessor:
                     if ret:
                         print("[PROC] Kamera pulih.")
                         return frame
-        raise SourceError(f"Kamera index {idx} berhenti mengirim frame "
-                          f"(sudah {CAMERA_REOPEN_ATTEMPTS}x dibuka ulang)")
+        return self._reconnect_live(cap, source, live)
+
+    def _reconnect_live(self, cap, source: dict, live: Optional[Dict]) -> Optional[np.ndarray]:
+        """
+        Kamera terputus (kabel / daya / jaringan): sambung ulang TANPA BATAS dengan
+        jeda LIVE_RECONNECT_WAITS (lalu tetap 30 detik), state "reconnecting".
+        Data kendaraan tidak disentuh; detik logika tetap mengikuti jam nyata, jadi
+        durasi kendaraan yang masih ada tetap benar setelah tersambung lagi. State
+        sesi tetap disimpan tiap percobaan, supaya backend yang mati di tengah
+        putusnya kamera tetap bisa melanjutkan sesi.
+        Return frame pertama setelah tersambung; None bila stop() atau ada sumber baru.
+        """
+        live    = live or {}
+        session = live.get("session")
+        what    = self._source_title(source)
+        lost_at = time.monotonic()
+        print(f"[PROC] {what} terputus; disambung ulang terus sampai kembali (data kendaraan tetap disimpan).")
+        if session is not None:
+            session.event(f"{what} terputus, menyambung ulang...")
+        self.shared.set_proc_state("reconnecting")
+        attempt = 0
+        while True:
+            wait = LIVE_RECONNECT_WAITS[min(attempt, len(LIVE_RECONNECT_WAITS) - 1)]
+            attempt += 1
+            self._push_text_frame("Kamera terputus - menyambung ulang",
+                                  [f"Percobaan ke-{attempt} dalam {wait} detik.",
+                                   "Data kendaraan tetap disimpan.",
+                                   "Ganti sumber dari dashboard untuk berhenti."],
+                                  title_color=(0, 165, 255), text_color=(190, 190, 190))
+            self._save_live(live)
+            if self._wait_interrupted(wait):
+                return None
+            print(f"[PROC] Menyambung ulang {self._describe_source(source)} (percobaan {attempt})...")
+            cap.release()
+            cap.open(self._camera_target(source))
+            if not cap.isOpened():
+                continue
+            ret, frame = cap.read()
+            if ret:
+                lost = int(time.monotonic() - lost_at)
+                print(f"[PROC] {what} tersambung lagi setelah {lost} detik.")
+                if session is not None:
+                    session.event(f"{what} tersambung lagi setelah {lost} detik terputus.")
+                self.shared.set_proc_state("running")
+                return frame
 
     @staticmethod
     def _grab_base(cap, fps: float) -> Optional[int]:
@@ -1315,13 +1786,114 @@ class VideoProcessor:
         # grab() gagal tetapi cap.set() menemukan frame-nya: hitungan dan waktu tidak sejalan
         return ret, frame, None if ret else base
 
-    def _run_inner(self, cap, source: dict, vehicle_model, triangle_model) -> Optional[dict]:
-        """Satu sumber: frame pertama → ROI → loop tick. Nilai kembali sama dengan _run_source."""
-        is_camera = source.get("type") == "camera"
-        if is_camera and not cap.isOpened() and not self._retry_camera_open(cap, source):
+    def _run_inner(self, cap, source: dict, vehicle_model, triangle_model,
+                   live: Dict) -> Optional[dict]:
+        """
+        Satu sumber: frame pertama → ROI → loop tick. Nilai kembali sama dengan _run_source.
+        Sumber langsung mengisi `live` (sesi kamera: session, records, state()) untuk
+        _run_source, yang menutup atau menyimpan sesinya saat sumber ini selesai.
+        """
+        is_camera = source.get("type") in LIVE_SOURCE_TYPES     # webcam atau kamera IP
+
+        # State tracking (dibuat di awal supaya live_state() selalu bisa dipanggil)
+        parked_records:       Dict[int, ParkedRecord] = {}
+        tracker_to_logical:   Dict[int, int]          = {}
+        cached_triangle:      Dict                    = {}
+        next_logical_id       = 1
+        last_logic_second     = -1
+        tick_second           = 0
+        ticks_done            = 0                       # untuk status "proc"
+        live_started          = time.monotonic()        # sumber langsung: detik 0 = jam nyata saat ini
+        last_announce         = -9999                   # detik logika peringatan suara terakhir
+        last_screenshot       = -9999                   # detik logika screenshot pelanggaran terakhir
+        last_save             = -9999                   # detik logika state sesi terakhir disimpan
+        last_tick             = 0                       # detik logika tick terakhir yang dianalisis
+        roi_mode              = self.shared.get_roi_mode()
+        roi_norm: Optional[list] = None                 # zona manual dari dashboard (0..1), untuk state
+        # Sesi kamera: kendaraan yang belum terlihat lagi sejak jeda tanpa pengamatan
+        # (kamera putus / backend mati) → detik terakhir ia teramati. Jeda itu tidak
+        # dihitung sebagai waktu berhenti di log, dan ia tidak disebut pelanggar
+        # selama belum terlihat lagi.
+        gap_seen: Dict[int, int] = {}
+        ended: set            = set()                   # LID yang sudah dicatat pergi, belum dihapus
+
+        # Sesi kamera yang dilanjutkan (backend hidup lagi / error): hanya bila sumbernya sama
+        resume, self._resume = self._resume, None
+        if resume is not None and not (is_camera and self._same_live_source(resume["_source"], source)):
+            self._finish_saved_session(resume, "sumber lain dipilih dari dashboard")
+            resume = None
+        if resume is None:
+            # Sesi kamera lain yang masih tersimpan (terhenti karena error / backend
+            # dihentikan, lalu sumber lain dipilih) tidak akan dilanjutkan: ditutup rapi
+            leftover = LiveSession.load_state()
+            if leftover is not None:
+                self._finish_saved_session(leftover, "sumber lain dipilih dari dashboard")
+        session: Optional[LiveSession] = None
+        if is_camera:
+            source_state = self._source_state(source)
+
+            def live_state() -> Dict:
+                """State sesi kamera untuk disimpan (dipanggil kapan saja, membaca nilai terbaru)."""
+                # Record yang sudah dicatat pergi tidak ikut disimpan (baris log-nya sudah
+                # antre), jadi sesi yang dilanjutkan tidak mencatatnya dua kali
+                return {"source": source_state, "roi_mode": roi_mode, "roi": roi_norm,
+                        "logic_second": max(tick_second, int(time.monotonic() - live_started)),
+                        "last_tick": last_tick,
+                        "next_logical_id": next_logical_id, "last_announce": last_announce,
+                        "last_screenshot": last_screenshot,
+                        "records": {str(lid): asdict(rec) for lid, rec in parked_records.items()
+                                    if lid not in ended},
+                        "triangles": {str(lid): t for lid, t in cached_triangle.items() if lid not in ended},
+                        "gap_seen": {str(lid): s for lid, s in gap_seen.items() if lid not in ended}}
+
+            live.update(records=parked_records, state=live_state, source_state=source_state)
+        if resume is not None:
+            session = live["session"] = LiveSession.reopen(resume)
+            roi_mode = resume.get("roi_mode") or "auto"
+            roi_norm = resume.get("roi")
+            # Detik logika melanjutkan jam sesi: durasi kendaraan ikut berjalan selama backend mati
+            elapsed      = max(0.0, time.time() - session.started_wall)
+            tick_second  = int(elapsed)
+            live_started = time.monotonic() - elapsed
+            try:
+                for k, d in (resume.get("records") or {}).items():
+                    parked_records[int(k)] = record_from_state(d)
+                for k, tdata in (resume.get("triangles") or {}).items():
+                    cached_triangle[int(k)] = [(tuple(int(v) for v in box), str(name), float(conf))
+                                               for box, name, conf in tdata]
+                next_logical_id = max(int(resume.get("next_logical_id", 1)), max(parked_records, default=0) + 1)
+                last_announce   = int(resume.get("last_announce", -9999))
+                last_screenshot = int(resume.get("last_screenshot", -9999))
+                last_tick       = int(resume.get("last_tick", resume.get("logic_second", 0)))
+                gap_seen.update(self._gap_from_state(resume))
+                # Selama backend mati tidak ada yang teramati: kendaraan yang terlihat di
+                # tick terakhir terakhir teramati pada detik itu
+                for lid, rec in parked_records.items():
+                    if rec.hidden_since is None:
+                        gap_seen.setdefault(lid, last_tick)
+            except (KeyError, TypeError, ValueError) as e:
+                print(f"[SESI] Data kendaraan sesi tersimpan rusak, dimulai kosong: {e}")
+                parked_records.clear(); cached_triangle.clear(); gap_seen.clear()
+            gap = int(time.time() - float(resume.get("saved_wall", time.time())))
+            session.event(f"Backend berjalan lagi (sekitar {gap} detik sejak simpanan terakhir); sesi "
+                          f"dilanjutkan dengan {len(parked_records)} kendaraan, kamera disambung ulang.")
+            self.shared.set_session(session.info())
+            print(f"[SESI] Sesi kamera dilanjutkan: {len(parked_records)} kendaraan, log {session.log_path}")
+
+        # Coba buka ulang hanya untuk webcam (driver Windows kadang menolak sesaat).
+        # Kamera IP tidak: pembukaan pertama sudah menunggu RTSP_OPEN_TIMEOUT_MS, dan
+        # password salah yang dicoba berulang bisa mengunci IP mini PC di kamera
+        # (Hikvision: kunci login setelah beberapa kali gagal).
+        if (source.get("type") == "camera" and not cap.isOpened() and resume is None
+                and not self._retry_camera_open(cap, source)):
             return None             # stop(), atau sumber baru (diambil loop pengawas)
         if not cap.isOpened():
-            raise SourceError(f"Sumber tidak bisa dibuka: {self._describe_source(source)}")
+            if resume is None:
+                raise SourceError(f"Sumber tidak bisa dibuka: {self._describe_source(source)}")
+            # Sesi yang dilanjutkan: password sudah terbukti benar, kamera mungkin belum
+            # menyala lagi → tunggu terus sampai bisa dibuka
+            if self._reconnect_live(cap, source, live) is None:
+                return None         # stop(), atau sumber baru (diambil loop pengawas)
 
         fps          = cap.get(cv2.CAP_PROP_FPS)
         if not (math.isfinite(fps) and fps > 0):
@@ -1334,7 +1906,7 @@ class VideoProcessor:
         # 4. Baca frame pertama, simpan untuk ROI drawing di frontend
         ret, first_frame = cap.read()
         if not ret and is_camera:
-            first_frame = self._recover_camera(cap, source)
+            first_frame = self._recover_camera(cap, source, live)
             if first_frame is None:
                 return None         # stop(), atau sumber baru (diambil loop pengawas)
         elif not ret:
@@ -1348,13 +1920,17 @@ class VideoProcessor:
             print("[PROC] Frame pertama tersimpan untuk ROI drawing.")
 
         # 5. Tentukan ROI berdasarkan mode
-        roi_mode     = self.shared.get_roi_mode()
         roi_polygons: List[List[Tuple[int, int]]] = []
 
-        if roi_mode == "auto":
+        if resume is not None and roi_mode != "auto" and roi_norm:
+            # Sesi yang dilanjutkan: zona yang sama, tanpa menunggu dashboard
+            roi_polygons = self._decode_roi(roi_norm, W, H)
+            print(f"[PROC] Zona sesi dilanjutkan: {len(roi_polygons)} zona")
+        if not roi_polygons and (roi_mode == "auto" or resume is not None):
+            roi_mode, roi_norm = "auto", None
             roi_polygons = self._make_auto_roi(W, H)
             print(f"[PROC] Auto-ROI: seluruh frame ({W}×{H})")
-        else:
+        elif not roi_polygons:
             # Manual: tunggu ROI dari frontend. Cukup SATU frame diam yang di-push;
             # video tidak di-decode dan di-encode berulang selama menunggu.
             print("[PROC] Menunggu ROI dari frontend (/set_roi)...")
@@ -1371,6 +1947,7 @@ class VideoProcessor:
                 roi_raw = self.shared.take_roi()
                 if roi_raw:
                     roi_polygons = self._decode_roi(roi_raw, W, H)
+                    roi_norm     = roi_raw
                     n = sum(len(p) for p in roi_polygons)
                     print(f"[PROC] ROI diterima: {len(roi_polygons)} zona, {n} titik total")
                     break
@@ -1385,21 +1962,33 @@ class VideoProcessor:
         # 6. Tick pertama memakai frame pertama yang sudah dibaca (file video:
         #    frame 0, jadi tidak perlu seek + decode ulang ke awal)
         current_frame = first_frame
+        if is_camera and roi_mode != "auto" and resume is None:
+            # Sumber langsung: frame pertama diambil sebelum zona digambar (bisa
+            # beberapa menit lalu); tick pertama memakai frame terbaru. Gagal baca
+            # di sini tidak apa-apa: frame berikutnya ditangani _recover_camera.
+            ret, fresh = cap.read()
+            if ret:
+                current_frame = fresh
         frame_pos     = 1       # file video: nomor frame yang dibaca read() berikutnya
         # file video: patokan memilih frame dengan menghitung grab() (lihat _read_video_frame)
         grab_base     = None if is_camera else self._grab_base(cap, fps)
         self._push_hint_frame(first_frame, "Memulai deteksi...")
         self.shared.set_proc_state("running")
+        tick_started  = time.perf_counter()     # hanya untuk tick_ms, bukan logika
 
-        # 5. Inisialisasi state tracking
-        parked_records:       Dict[int, ParkedRecord] = {}
-        tracker_to_logical:   Dict[int, int]          = {}
-        cached_triangle:      Dict                    = {}
-        next_logical_id       = 1
-        last_logic_second     = -1
-        tick_second           = 0
-        ticks_done            = 0                       # untuk status "proc"
-        tick_started          = time.perf_counter()     # hanya untuk tick_ms, bukan logika
+        if is_camera and session is None:
+            # Sesi kamera baru: detik 0 = sekarang
+            zone_text = ("seluruh frame" if roi_mode == "auto"
+                         else f"{len(roi_polygons)} zona digambar di dashboard")
+            session = live["session"] = LiveSession.start(
+                self._describe_source(source), zone_text,
+                f"peringatan >= {PARKING_CHECK_SECONDS} dtk berhenti, pelanggaran >= "
+                f"{ILLEGAL_PARKING_SECONDS} dtk tanpa segitiga pengaman")
+            live_started = time.monotonic() - (time.time() - session.started_wall)
+            self.shared.set_session({**session.info(), "zones": len(roi_polygons)})
+            if source_state is None:
+                session.event("Alamat kamera tidak bisa dienkripsi: sesi ini tidak bisa dilanjutkan "
+                              "otomatis bila backend mati.")
 
         # 6. Loop utama — sama persis dengan run_video() di demo3_tts.py
         while not self._stop.is_set():
@@ -1413,10 +2002,20 @@ class VideoProcessor:
             roi_raw = self.shared.take_roi()
             if roi_raw:
                 roi_polygons = self._decode_roi(roi_raw, W, H)
+                if session is not None:
+                    # Kendaraan di zona lama selesai dicatat; nomor LID dalam satu sesi
+                    # kamera tidak diulang dari 1 supaya baris log tetap unik
+                    self._log_all_stops(session, parked_records, last_tick, "zona diubah", gap_seen)
+                    session.event(f"Zona diubah dari dashboard: {len(roi_polygons)} zona.")
+                    roi_mode, roi_norm = "manual", roi_raw
+                    gap_seen.clear()
+                    last_save = -9999       # state langsung disimpan ulang (tick ini)
+                else:
+                    next_logical_id = 1
                 parked_records.clear()
                 tracker_to_logical.clear()
                 cached_triangle.clear()
-                next_logical_id = 1
+                last_announce = last_screenshot = -9999
                 if self._tts is not None:
                     self._tts.clear()
                 print(f"[PROC] ROI diperbarui: {len(roi_polygons)} zona")
@@ -1440,6 +2039,7 @@ class VideoProcessor:
             frame        = current_frame    # hanya dibaca; semua gambar ditulis ke vis
             vis          = frame.copy()
             logic_second = tick_second
+            logged_before = session.logged if session is not None else 0
             video_second = tick_second
 
             draw_all_rois(vis, roi_polygons)
@@ -1672,11 +2272,19 @@ class VideoProcessor:
                 del parked_records[victim]
                 for t in [t for t, l in tracker_to_logical.items() if l == victim]:
                     del tracker_to_logical[t]
+                gap_seen.pop(victim, None)
+
+            # Sesi kamera: kendaraan yang terlihat lagi setelah jeda tanpa pengamatan memang
+            # masih di sana, jadi jedanya tetap dihitung sebagai waktu berhenti (seperti semula)
+            for lid in visible_logical_ids:
+                gap_seen.pop(lid, None)
 
             # ── Analisis per detik ─────────────────────────────
+            shot_list = None        # pelanggar untuk screenshot tick ini (sesi kamera)
             if logic_second != last_logic_second:
                 to_delete = []
                 violators = []      # (lid, rec) yang sedang melanggar dan terlihat tick ini
+                hidden_violators = []   # pelanggar yang baru sebentar tidak terlihat (tertutup)
                 for lid, rec in parked_records.items():
                     if rec.hidden_since is not None:
                         if logic_second - rec.hidden_since > hidden_ttl_seconds(rec):
@@ -1684,6 +2292,15 @@ class VideoProcessor:
                                 del tracker_to_logical[rec.tracker_id]
                             cached_triangle.pop(lid, None)
                             to_delete.append(lid)
+                            # Kendaraan sudah pergi: hilang dari dashboard, dicatat di log sesi
+                            self._log_stop(session, lid, rec, stop_end_second(rec, logic_second),
+                                           "pergi dari zona", gap_seen.pop(lid, None))
+                            ended.add(lid)
+                        elif (rec.parked_since is not None and not rec.triangle_found
+                                and lid not in gap_seen
+                                and logic_second - rec.hidden_since <= VIOLATOR_HIDDEN_GRACE
+                                and get_elapsed_seconds(rec, logic_second) >= ILLEGAL_PARKING_SECONDS):
+                            hidden_violators.append((lid, rec))
                         continue
 
                     if rec.prev_logic_center is None:
@@ -1711,6 +2328,9 @@ class VideoProcessor:
                                 md = logic_second - rec.moving_since
                                 rr = get_required_moving_reset_seconds(rec, logic_second)
                                 if md >= rr * 1.5:
+                                    # Berhenti selesai (kendaraan bergerak lagi): dicatat sebelum direset
+                                    self._log_stop(session, lid, rec, rec.moving_since,
+                                                   "bergerak lagi / meninggalkan tempat")
                                     rec.parked_since = rec.stationary_since = rec.moving_since = None
                                     rec.triangle_checked = rec.triangle_found = rec.illegal_seen = False
                                     rec.color_name = "unknown"
@@ -1770,25 +2390,41 @@ class VideoProcessor:
                         rec.illegal_seen = True
                         violators.append((lid, rec))
 
-                # Satu kalimat untuk SEMUA pelanggar yang terlihat, diucapkan bila ada
-                # satu saja yang sudah TTS_REPEAT_GAP detik tidak disebut (pelanggar
-                # baru = langsung). Urutan: yang paling dulu parkir disebut lebih dulu.
-                # last_alert_time semua yang disebut hanya maju (dan baris [ALERT] hanya
-                # tercetak) bila pesan benar-benar diterima untuk disuarakan; yang ditolak
-                # (masih diputar, TTS sedang gagal) dicoba lagi tick berikutnya.
-                # Dengan ENABLE_TTS=false alert hanya dicatat di log, seperti semula.
-                if any((logic_second - rec.last_alert_time) >= TTS_REPEAT_GAP for _, rec in violators):
-                    violators.sort(key=lambda v: (v[1].parked_since, v[0]))
-                    wt = make_warning_text([rec for _, rec in violators])
-                    lids = frozenset(lid for lid, _ in violators)
+                # Selama masih ada pelanggar: SATU kalimat untuk semua pelanggar (yang
+                # terlihat + yang baru sebentar tertutup), tiap TTS_ANNOUNCE_GAP detik,
+                # diucapkan TTS_SAY_TIMES kali (TTSSpeaker). Pelanggar pertama langsung.
+                # Urutan: yang paling dulu parkir disebut lebih dulu. Jadwal hanya maju
+                # (dan baris [ALERT] hanya tercetak) bila pesan benar-benar diterima untuk
+                # disuarakan; yang ditolak (masih diputar, TTS sedang gagal) dicoba lagi
+                # tick berikutnya. Dengan ENABLE_TTS=false alert hanya dicatat di log.
+                announce = sorted(violators + hidden_violators, key=lambda v: (v[1].parked_since, v[0]))
+                if announce and logic_second - last_announce >= TTS_ANNOUNCE_GAP:
+                    wt = make_warning_text([rec for _, rec in announce])
+                    lids = frozenset(lid for lid, _ in announce)
                     if self._tts is None or self._tts.submit(lids, wt):
                         print(f"[ALERT {logic_second:04d}s] {wt}")
-                        for _, rec in violators:
+                        last_announce = logic_second
+                        for _, rec in announce:
                             rec.last_alert_time = logic_second
+
+                # Screenshot pelanggaran (sesi kamera): pelanggar pertama langsung, lalu
+                # tiap SCREENSHOT_INTERVAL detik selama masih ada pelanggar. Diambil
+                # setelah frame selesai digambar (lihat di bawah).
+                # Jadwal diulang dari awal hanya bila sudah tidak ada pelanggar sama sekali
+                # (pelanggar yang sedang tertutup kendaraan lewat tetap dihitung ada).
+                if not any(r.parked_since is not None and not r.triangle_found and l not in gap_seen
+                           and l not in to_delete
+                           and get_elapsed_seconds(r, logic_second) >= ILLEGAL_PARKING_SECONDS
+                           for l, r in parked_records.items()):
+                    last_screenshot = -9999
+                elif (announce and session is not None
+                        and logic_second - last_screenshot >= SCREENSHOT_INTERVAL):
+                    shot_list = announce
 
                 for lid in to_delete:
                     del parked_records[lid]
-                last_logic_second = logic_second
+                ended.clear()
+                last_logic_second = last_tick = logic_second
 
             # ── Draw: ghost (occluded) ─────────────────────────
             for lid, rec in parked_records.items():
@@ -1825,6 +2461,15 @@ class VideoProcessor:
             cv2.putText(vis, f"Video: {video_second}s", (20, 35),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2, cv2.LINE_AA)
 
+            if shot_list:
+                lines = [f"LID-{lid:02d} {describe_vehicle(rec)} - zona {rec.roi_idx + 1} - "
+                         f"berhenti {get_elapsed_seconds(rec, logic_second)} dtk"
+                         for lid, rec in shot_list[:8]]
+                if len(shot_list) > 8:
+                    lines.append(f"... dan {len(shot_list) - 8} kendaraan lain")
+                session.screenshot(vis, lines)
+                last_screenshot = logic_second      # gagal pun tidak dicoba tiap tick
+
             # ── Tulis ke SharedState ───────────────────────────
             self._push_frame(vis)
             alerts = self._build_alerts(parked_records, logic_second)
@@ -1836,6 +2481,16 @@ class VideoProcessor:
             }
             self.shared.set_alerts(alerts, stats)
 
+            # Sesi kamera: state disimpan berkala supaya backend yang mati mendadak
+            # melanjutkan sesi yang sama (lihat _load_resume). Tick yang menulis baris log
+            # langsung disimpan, supaya state dan log tidak berselisih.
+            if session is not None and (logic_second - last_save >= SESSION_SAVE_SECONDS
+                                        or session.logged != logged_before):
+                if source_state is not None:
+                    session.save_state(live_state())
+                self.shared.set_session({**session.info(), "zones": len(roi_polygons)})
+                last_save = logic_second
+
             # Status "proc": jumlah tick selesai + lama tick ini (jam nyata, antar publikasi)
             ticks_done += 1
             now = time.perf_counter()
@@ -1844,13 +2499,31 @@ class VideoProcessor:
 
             # ── Maju ke detik berikutnya ──────────────────────────
             if is_camera:
-                # Kamera: 1 tick = 1 frame yang diproses; baca frame berikutnya langsung
+                # Sumber langsung: detik logika = detik nyata sejak deteksi dimulai.
+                # Dulu 1 tick = 1 detik, padahal satu tick di mini PC makan 1-2 detik,
+                # sehingga durasi parkir tercatat lebih pendek dari kenyataan. Tick
+                # yang lebih cepat dari 1 detik menunggu detik berikutnya, jadi
+                # detik logika tetap naik tepat satu per tick seperti semula; tick
+                # yang lambat melompati detik yang terlewat (ambang di logika
+                # memakai selisih detik, jadi lompatan tetap dihitung benar).
                 tick_second += 1
+                early = live_started + tick_second - time.monotonic()
+                if early > 0 and self._stop.wait(early):
+                    return None         # stop()
                 ret, current_frame = cap.read()
                 if not ret:
-                    current_frame = self._recover_camera(cap, source)
+                    current_frame = self._recover_camera(cap, source, live)
                     if current_frame is None:
                         return None     # stop(), atau sumber baru (diambil loop pengawas)
+                now_second = int(time.monotonic() - live_started)
+                if session is not None and now_second - logic_second > LIVE_GAP_SECONDS:
+                    # Jeda tanpa pengamatan (kamera putus, tick macet): kendaraan yang
+                    # terlihat di tick terakhir terakhir teramati pada detik itu
+                    for lid, rec in parked_records.items():
+                        if rec.hidden_since is None:
+                            gap_seen.setdefault(lid, logic_second)
+                    last_save = -9999
+                tick_second = max(tick_second, now_second)
             else:
                 # Video file: maju TICK_STEP detik video, ambil frame target
                 tick_second += TICK_STEP
@@ -1878,6 +2551,7 @@ class VideoProcessor:
                     last_logic_second = -1
                     parked_records.clear(); tracker_to_logical.clear()
                     cached_triangle.clear(); next_logical_id = 1
+                    last_announce = last_screenshot = -9999
                     # State tracker sengaja TIDAK di-reset di sini (sama seperti semula):
                     # pemetaan tracker_to_logical sudah dikosongkan, ID tracker lanjut naik.
                     if self._tts is not None:

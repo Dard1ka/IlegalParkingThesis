@@ -67,15 +67,24 @@ Satu-satunya tempat alamat backend: `parking-dashboard\src\config.js` (`API_BASE
 | `GET /upload/check?size=<byte>&sample=<sha256 hex>` | sidik video, lihat 3.4 | `{status:"ok", found:false}` atau `{status:"ok", found:true, path, filename, reused:true}` |
 | `PUT /upload/stream?filename=<nama>` | body = isi file mentah (bukan multipart) | `{status:"ok", path, filename, reused}` / `{status:"error", message}` |
 | `POST /upload` | multipart `file` (cara lama) | sama seperti di atas |
-| `POST /configure` | `{source_type:"video"\|"camera", path?, camera_index?, roi_mode:"manual"\|"auto"}` | `{status:"ok", source, roi_mode}` / `{status:"error", message}` |
+| `POST /configure` | `{source_type:"video"\|"camera"\|"rtsp", path?, camera_index?, url?, roi_mode:"manual"\|"auto"}` | `{status:"ok", source, roi_mode}` / `{status:"error", message}` |
 | `GET /first_frame` | – | JPEG, atau 204 bila belum siap |
 | `POST /set_roi` | `{rois: [[[x,y],...], ...]}`; koordinat **ternormalisasi 0..1**, minimal 3 titik per zona | `{status:"ok", zones, points}` |
 | `GET /video_feed` | – | MJPEG (`multipart/x-mixed-replace`); pasang di `<img src>` |
-| `GET /status` | – | `{running, source, roi_mode, has_first_frame, stats, alerts, proc}` |
+| `GET /status` | – | `{running, source, roi_mode, has_first_frame, stats, alerts, proc, session}`; `session` = sesi kamera `{started, folder, log_file, logged, screenshots, zones}` atau `null` |
 | `GET /debug` | – | seperti `/status` plus `roi_pending`, `ws_clients` |
 | `WS /ws/alerts` | – | pesan JSON tiap ada perubahan: `{alerts, stats, proc}` |
 
 Catatan endpoint:
+- **Kamera IP (CCTV)**, sejak update 11-11-2026:
+  - Kirim `source_type:"rtsp"` dengan `url` = `rtsp://<user>:<password>@<ip>:554/Streaming/Channels/101`.
+    User dan password di-`encodeURIComponent`.
+  - Backend menolak alamat yang bukan `rtsp://` atau yang tanpa IP.
+  - Password selalu disamarkan (`***`) di response, `/status`, dan log, jadi UI tidak bisa membacanya kembali dari
+    server.
+  - Bila kamera tidak bisa dibuka, setelah sekitar 5 detik `proc.state = "error"` dengan pesan di `proc.error`.
+  - Untuk webcam dan kamera IP, `duration` dihitung dari jam nyata. Untuk file video tetap
+    `PARKING_TICK_STEP` detik video per tick.
 - Format video yang diterima dicek di backend (`ALLOWED_VIDEO_EXTS` di `main.py`).
 - Untuk `/upload/stream`, browser wajib mengirim `Content-Length`. Unggahan yang tidak lengkap dibuang.
 - Selama unggahan dari komputer yang sama berjalan, deteksi dijeda (`proc.state = "paused"`).
@@ -96,7 +105,7 @@ Catatan endpoint:
 
 // proc
 { "state": "running",  // loading_models | waiting_source | opening_source | waiting_roi
-                       // | running | paused | error | stopped
+                       // | running | paused | reconnecting (kamera putus, disambung ulang) | error | stopped
   "tick": 120, "tick_ms": 1150.0, "error": null }
 ```
 
@@ -121,8 +130,8 @@ Implementasi JS yang sudah jalan ada di `SetupWizard.jsx` (baris 66–85). Forma
 
 | File | Fungsi |
 |---|---|
-| `src\App.jsx` | layout utama, perpindahan tampilan setup ↔ monitor |
-| `src\components\SetupWizard.jsx` | langkah sumber video → mode zona → gambar zona (upload, configure, set_roi) |
+| `src\App.jsx` | layout utama, perpindahan tampilan setup ↔ monitor. Saat dimuat, bila `/status` menunjukkan sesi kamera sedang berjalan, dashboard langsung tampil tanpa wizard (memilih kamera lagi = sesi baru, durasi mulai dari nol) |
+| `src\components\SetupWizard.jsx` | langkah sumber video (file / kamera USB / kamera IP) → mode zona → gambar zona (upload, configure, set_roi) |
 | `src\components\ZoneEditor.jsx`, `src\lib\roiDraw.js`, `src\lib\roiGeometry.js` | menggambar dan mengedit polygon zona (koordinat ternormalisasi) |
 | `src\components\VideoMonitor.jsx` | stream MJPEG, overlay zona, ubah zona saat berjalan |
 | `src\components\AlertSidebar.jsx` | daftar kendaraan dan statusnya |

@@ -73,11 +73,14 @@ rem preview kedua pindah ke port 4174).
 
 rem Backend (jendela 1). disable_quickedit.py mematikan QuickEdit khusus jendela ini
 rem (klik di jendela tidak lagi membekukan deteksi), lalu menjalankan uvicorn.
+rem --ulang: backend yang mati mendadak (mis. galat baca disk) dijalankan lagi
+rem otomatis, dan sesi kamera yang sedang berjalan dilanjutkan (kamera, zona,
+rem kendaraan beserta durasinya). Lihat outputs\sesi_kamera.
 curl -s -o nul http://127.0.0.1:8000/status
 if not errorlevel 1 (
     echo [INFO] Backend sudah berjalan di port 8000, tidak dijalankan lagi.
 ) else (
-    start "Backend - Illegal Parking" cmd /k python tools\disable_quickedit.py uvicorn backend.main:app --host 0.0.0.0 --port 8000
+    start "Backend - Illegal Parking" cmd /k python tools\disable_quickedit.py --ulang uvicorn backend.main:app --host 0.0.0.0 --port 8000
 )
 
 rem Dashboard hasil build (jendela 2), lebih ringan dari npm run dev

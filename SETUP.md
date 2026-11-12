@@ -145,7 +145,7 @@ Dashboard otomatis memanggil backend di `http://<hostname halaman>:8000`. Kalau 
 ### Alur penggunaan dashboard:
 
 1. Buka `http://localhost:5173` (dev) atau `http://localhost:4173/?lite` (build, mini PC)
-2. **1 Sumber video**: "File video" (unggah, atau centang "Pakai video yang sedang aktif") atau "Kamera" (indeks 0, 1, ...)
+2. **1 Sumber video**: "File video" (unggah, atau centang "Pakai video yang sedang aktif"), "Kamera" (indeks 0, 1, ...), atau "Kamera IP (CCTV)" (RTSP, lihat [`PANDUAN_KAMERA_IP.md`](PANDUAN_KAMERA_IP.md))
 3. **2 Zona larangan**: pilih "Seluruh frame" atau "Gambar zona"
    - *Gambar zona*: klik sudut-sudut zona (atau pakai keyboard), Selesaikan zona, lalu "Simpan n zona dan mulai"
    - *Seluruh frame*: "Mulai pemantauan", seluruh frame jadi zona

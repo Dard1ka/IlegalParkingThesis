@@ -14,10 +14,28 @@ import RuleLane from './RuleLane'
 const VIDEO_TYPES = ['video/mp4', 'video/avi', 'video/quicktime', 'video/x-matroska', 'video/webm']
 const NO_SERVER = 'Server deteksi tidak merespons. Jalankan server deteksi, lalu coba lagi.'
 
-// Label sumber singkat ("input3.mp4" / "Kamera 0")
+// Label sumber singkat ("input3.mp4" / "Kamera 0" / "Kamera IP 192.168.1.64:554")
 function sourceLabelOf(info) {
   if (!info) return ''
-  return info.sourceType === 'camera' ? `Kamera ${info.camIndex}` : info.filename
+  if (info.sourceType === 'camera') return `Kamera ${info.camIndex}`
+  if (info.sourceType === 'rtsp') return `Kamera IP ${info.host}`
+  return info.filename
+}
+
+// ─── Kamera IP (RTSP) ────────────────────────────────────────
+// Stream utama kamera Hikvision (1080p). "192.168.1.64", "192.168.1.64:8554",
+// atau alamat yang ditempel lengkap ("rtsp://…/…") → host:port saja.
+const RTSP_PORT = 554
+const RTSP_PATH = '/Streaming/Channels/101'
+
+function rtspHostOf(raw) {
+  const h = raw.trim().replace(/^[a-z]+:\/\//i, '').replace(/^.*@/, '').replace(/\/.*$/, '')
+  if (!h) return ''
+  return /:\d+$/.test(h) ? h : `${h}:${RTSP_PORT}`
+}
+
+function rtspUrlOf(host, user, pass) {
+  return `rtsp://${encodeURIComponent(user.trim())}:${encodeURIComponent(pass)}@${host}${RTSP_PATH}`
 }
 
 // 627 572 352 byte jadi "598,5" (format Indonesia, satu angka desimal)
@@ -140,6 +158,11 @@ function StepSource({ initial, focusTitle, onNext }) {
   const [sourceType, setSourceType] = useState(initial?.sourceType ?? null)
   const [videoFile,  setVideoFile]  = useState(null)
   const [camIndex,   setCamIndex]   = useState(initial?.sourceType === 'camera' ? initial.camIndex : 0)
+  // Kamera IP: diisi lagi saat kembali dari langkah 2 (hanya di memori, tidak disimpan)
+  const ipInitial = initial?.sourceType === 'rtsp' ? initial : null
+  const [camHost,    setCamHost]    = useState(ipInitial?.camHost ?? '')
+  const [camUser,    setCamUser]    = useState(ipInitial?.camUser ?? 'admin')
+  const [camPass,    setCamPass]    = useState(ipInitial?.camPass ?? '')
   const [dragOver,   setDragOver]   = useState(false)
   const [fileError,  setFileError]  = useState('')   // format file salah (di bawah dropzone)
   const [error,      setError]      = useState('')   // unggah / server (di bawah tombol)
@@ -285,6 +308,11 @@ function StepSource({ initial, focusTitle, onNext }) {
       onNext({ sourceType: 'camera', camIndex })
       return
     }
+    if (sourceType === 'rtsp') {
+      const host = rtspHostOf(camHost)
+      onNext({ sourceType: 'rtsp', url: rtspUrlOf(host, camUser, camPass), host, camHost, camUser, camPass })
+      return
+    }
     if (useActive && activeVideo && !videoFile) {
       onNext({ sourceType: 'video', path: activeVideo.path, filename: activeVideo.filename })
       return
@@ -301,6 +329,8 @@ function StepSource({ initial, focusTitle, onNext }) {
     reason = activeVideo
       ? 'Pilih file video atau pakai video yang sedang aktif.'
       : 'Pilih file video untuk melanjutkan.'
+  } else if (sourceType === 'rtsp' && (!rtspHostOf(camHost) || !camUser.trim() || !camPass)) {
+    reason = 'Isi alamat IP, username, dan password kamera untuk melanjutkan.'
   }
 
   const pct = progress.total ? (progress.loaded / progress.total) * 100 : 0
@@ -314,7 +344,7 @@ function StepSource({ initial, focusTitle, onNext }) {
   return (
     <>
       <h1 ref={titleRef} tabIndex={-1} className="wizard-title focus:outline-none">Pilih sumber video</h1>
-      <p className="wizard-lead">Rekaman video atau kamera yang terhubung ke komputer ini.</p>
+      <p className="wizard-lead">Rekaman video, kamera USB, atau kamera IP yang terhubung ke komputer ini.</p>
 
       <fieldset className="opt-list wizard-group" disabled={uploading}>
         <legend className="sr-only">Sumber video</legend>
@@ -342,6 +372,19 @@ function StepSource({ initial, focusTitle, onNext }) {
           <span>
             <span className="opt-title">Kamera</span>
             <span className="opt-desc">Kamera bawaan atau USB yang terhubung ke komputer ini.</span>
+          </span>
+        </label>
+        <label className="opt">
+          <input
+            type="radio"
+            name="source"
+            value="rtsp"
+            checked={sourceType === 'rtsp'}
+            onChange={() => chooseType('rtsp')}
+          />
+          <span>
+            <span className="opt-title">Kamera IP (CCTV)</span>
+            <span className="opt-desc">Kamera jaringan lewat kabel LAN, mis. Hikvision (RTSP).</span>
           </span>
         </label>
       </fieldset>
@@ -422,6 +465,56 @@ function StepSource({ initial, focusTitle, onNext }) {
         </div>
       )}
 
+      {sourceType === 'rtsp' && (
+        <div className="wizard-group grid gap-4">
+          <div>
+            <label className="field-label" htmlFor="cam-host">Alamat IP kamera</label>
+            <input
+              id="cam-host"
+              className="text-input mt-2"
+              type="text"
+              inputMode="url"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="192.168.1.64"
+              value={camHost}
+              onChange={(e) => setCamHost(e.target.value)}
+            />
+            <p className="help mt-2">IP kamera terlihat di SADP Tool. Port bawaan 554.</p>
+          </div>
+          <div className="field-grid">
+            <div>
+              <label className="field-label" htmlFor="cam-user">Username</label>
+              <input
+                id="cam-user"
+                className="text-input mt-2"
+                type="text"
+                autoComplete="off"
+                spellCheck={false}
+                value={camUser}
+                onChange={(e) => setCamUser(e.target.value)}
+              />
+            </div>
+            <div>
+              <label className="field-label" htmlFor="cam-pass">Password</label>
+              <input
+                id="cam-pass"
+                className="text-input mt-2"
+                type="password"
+                autoComplete="new-password"
+                value={camPass}
+                onChange={(e) => setCamPass(e.target.value)}
+              />
+            </div>
+          </div>
+          <p className="help">
+            Password yang dibuat saat aktivasi kamera. Dipakai stream utama
+            (1080p, {RTSP_PATH}); selama sesi berjalan disimpan terenkripsi di
+            komputer ini hanya untuk menyambung ulang otomatis.
+          </p>
+        </div>
+      )}
+
       {uploading ? (
         <div className="wizard-group upload">
           <div className="upload-head">
@@ -487,6 +580,7 @@ async function sendConfigure(sourceInfo, roiMode) {
     roi_mode:    roiMode,
   }
   if (sourceInfo.sourceType === 'video') body.path = sourceInfo.path
+  else if (sourceInfo.sourceType === 'rtsp') body.url = sourceInfo.url
   else body.camera_index = sourceInfo.camIndex
 
   const res = await fetch(`${API_BASE}/configure`, {
@@ -904,7 +998,8 @@ function StepDrawZones({ sourceInfo, onDone, onBack }) {
 // ─── Wizard ──────────────────────────────────────────────────
 // onComplete(info): info = { ...sourceInfo, roiMode: 'auto' | 'manual', zoneCount? }
 // sourceInfo video = { sourceType: 'video', path, filename },
-//            kamera = { sourceType: 'camera', camIndex }
+//            kamera = { sourceType: 'camera', camIndex },
+//         kamera IP = { sourceType: 'rtsp', url, host, camHost, camUser, camPass }
 // zoneCount (jumlah zona yang disimpan) hanya ada untuk mode manual.
 export default function SetupWizard({ onComplete }) {
   const [step,       setStep]       = useState('source')   // 'source' | 'zone' | 'draw'

@@ -7,7 +7,7 @@ Endpoints:
   GET  /upload/check  → Cari video yang sama di uploads/ (tanpa unggah ulang)
   PUT  /upload/stream → Upload file video (isi body = isi file), langsung ke disk
   POST /upload        → Upload file video (multipart, cara lama), simpan ke disk
-  POST /configure     → Set sumber (video/camera) + mode ROI
+  POST /configure     → Set sumber (video/camera/rtsp) + mode ROI
   GET  /first_frame   → Ambil frame pertama sebagai JPEG (untuk drawing ROI)
   POST /set_roi       → Terima koordinat multi-polygon ROI dari frontend
   GET  /video_feed    → MJPEG stream (satu part tiap ada frame baru)
@@ -38,7 +38,9 @@ from starlette.requests import ClientDisconnect
 from typing import Optional, List
 
 from .shared import SharedState
-from .processor import VideoProcessor, print_effective_config
+from urllib.parse import urlsplit
+
+from .processor import VideoProcessor, print_effective_config, mask_url, public_source
 
 
 # ══════════════════════════════════════════════════════════════
@@ -158,6 +160,8 @@ async def lifespan(app: FastAPI):
 
     processor.stop()
     broadcaster_task.cancel()
+    # Beri waktu tick yang sedang berjalan selesai, supaya state sesi kamera tersimpan rapi
+    await asyncio.to_thread(proc_thread.join, 5)
     print("[API] Shutdown selesai.")
 
 
@@ -440,10 +444,26 @@ def upload_video(file: UploadFile = File(...)):
 # ENDPOINT: Configure sumber + mode ROI
 # ══════════════════════════════════════════════════════════════
 class ConfigurePayload(BaseModel):
-    source_type: str          # "video" | "camera"
+    source_type: str          # "video" | "camera" | "rtsp"
     path: Optional[str] = None
     camera_index: Optional[int] = 0
+    url: Optional[str] = None # rtsp: rtsp://user:password@ip:554/Streaming/Channels/101
     roi_mode: str = "manual"  # "manual" | "auto"
+
+
+def _rtsp_url_error(url: str) -> Optional[str]:
+    """Pesan galat bila alamat kamera IP jelas salah; None bila boleh dicoba dibuka."""
+    try:
+        parts = urlsplit(url)
+        host = parts.hostname
+        parts.port                      # port bukan angka → ValueError
+    except ValueError:
+        return "Alamat kamera IP tidak valid."
+    if parts.scheme.lower() not in ("rtsp", "rtsps"):
+        return "Alamat kamera IP harus diawali rtsp://"
+    if not host:
+        return "Alamat kamera IP belum berisi IP kamera."
+    return None
 
 
 @app.post("/configure")
@@ -461,14 +481,23 @@ async def configure(payload: ConfigurePayload):
         source = {"type": "video", "path": str(p)}
     elif payload.source_type == "camera":
         source = {"type": "camera", "index": payload.camera_index or 0}
+    elif payload.source_type == "rtsp":
+        url = (payload.url or "").strip()
+        if not url:
+            return {"status": "error", "message": "url diperlukan untuk mode kamera IP."}
+        message = _rtsp_url_error(url)
+        if message:
+            return {"status": "error", "message": message}
+        source = {"type": "rtsp", "url": url}
     else:
         return {"status": "error", "message": f"source_type tidak valid: {payload.source_type}"}
 
     # Sumber + mode ROI disimpan sekaligus; data sumber lama ikut dikosongkan
     shared.set_source(source, payload.roi_mode)
 
-    print(f"[API] Konfigurasi: source={source}, roi_mode={payload.roi_mode}")
-    return {"status": "ok", "source": source, "roi_mode": payload.roi_mode}
+    # Password kamera IP tidak pernah dicetak / dikirim balik
+    print(f"[API] Konfigurasi: source={public_source(source)}, roi_mode={payload.roi_mode}")
+    return {"status": "ok", "source": public_source(source), "roi_mode": payload.roi_mode}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -603,7 +632,7 @@ async def ws_alerts(websocket: WebSocket):
 # ══════════════════════════════════════════════════════════════
 @app.get("/status")
 async def get_status():
-    source = shared.get_source()
+    source = public_source(shared.get_source())
     return {
         "running":        shared.is_running(),
         "source":         source,
@@ -612,6 +641,7 @@ async def get_status():
         "stats":          shared.get_stats(),
         "alerts":         shared.get_alerts(),
         "proc":           shared.get_proc(),
+        "session":        shared.get_session(),   # sesi kamera (log + screenshot), None bila tidak ada
     }
 
 
@@ -620,7 +650,7 @@ async def debug_state():
     """Snapshot state untuk troubleshooting event log kosong."""
     return {
         "running":          shared.is_running(),
-        "source":           shared.get_source(),
+        "source":           public_source(shared.get_source()),
         "roi_mode":         shared.get_roi_mode(),
         "has_first_frame":  shared.get_first_frame() is not None,
         "roi_pending":      shared.has_roi_pending(),
@@ -629,6 +659,7 @@ async def debug_state():
         "alerts":           shared.get_alerts(),
         "stats":            shared.get_stats(),
         "proc":             shared.get_proc(),
+        "session":          shared.get_session(),
     }
 
 
