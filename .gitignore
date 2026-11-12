@@ -22,10 +22,8 @@ env/
 ENV/
 
 # ── Model weights (too large for git — use Git LFS or releases) ─
-*.pt
 *.pth
 *.weights
-*.onnx
 
 # ── Video input files (too large) ─────────────────────────────
 input*.mp4
